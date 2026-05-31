@@ -8,8 +8,9 @@ This satisfies the brief's "push chunks as they're decoded, do NOT buffer the fu
 Over-generation note: the base Qwen3-TTS model rambles past EOS on certain text + reference-voice
 combinations. The pure-PyTorch reference does this IDENTICALLY (same texts cap at the same length),
 so it is NOT a kernel artifact -- the kernel reproduces the reference to ~0.9999 cosine (a
-faithfulness win). Mitigated app-side with tuned sampling (top_p 0.8, repetition_penalty 1.3) + a
-max_new_tokens cap (~12s ceiling); a neutral reference voice further reduces it.
+faithfulness win). Tightening sampling (rep_penalty/low temp) was tried and HURT quality (repetition
+collapse), so the model's intended sampling is kept + a max_new_tokens cap bounds the worst case; a
+neutral reference voice (and the 1.7B variant) further reduce it.
 """
 import sys, time, queue, asyncio, numpy as np, torch, soundfile as sf
 sys.path.insert(0, "/workspace")
@@ -32,11 +33,12 @@ class MegakernelStreamingTTS(TTSService):
         self._talker = tts.model.talker
         self._eos = int(getattr(self._talker.config, "codec_eos_token_id", -1))
         self._ref_audio, self._ref_text = ref_audio, ref_text
-        # Sampling tuned to curb the base model's over-generation on some texts (the pure-PyTorch
-        # reference rambles identically -> not a kernel issue); max_new_tokens caps the worst case (~12s).
-        self._gen = dict(max_new_tokens=150, do_sample=True, top_k=50, top_p=0.8, temperature=0.7,
-                         repetition_penalty=1.3, subtalker_dosample=True, subtalker_top_k=50,
-                         subtalker_top_p=0.8, subtalker_temperature=0.7)
+        # The model's INTENDED sampling (matches the official example) + a max_new_tokens safety cap.
+        # (Tightening rep_penalty/temperature was tried and HURT quality -- caused repetition collapse;
+        # over-generation on some texts is a base-model trait, not fixable by degrading sampling.)
+        self._gen = dict(max_new_tokens=200, do_sample=True, top_k=50, top_p=1.0, temperature=0.9,
+                         repetition_penalty=1.05, subtalker_dosample=True, subtalker_top_k=50,
+                         subtalker_top_p=1.0, subtalker_temperature=0.9)
         self._q = None
         svc = self
         def _hook(module, inputs, output):  # forward hook: does not alter forward signature
