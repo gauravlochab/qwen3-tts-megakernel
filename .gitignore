@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.wav
+*.safetensors
+*.egg-info/
+hf/
+qwen_megakernel/
+Qwen3-TTS/
+.DS_Store
