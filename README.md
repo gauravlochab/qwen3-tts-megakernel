@@ -1,8 +1,8 @@
 # qwen3-tts-megakernel
 
-Run AlpinDale's [`qwen_megakernel`](https://github.com/AlpinDale/qwen_megakernel) (a single-launch CUDA decode kernel for Qwen3-0.6B, ~1000 tok/s on an RTX 5090) as the **decode backend for the Qwen3-TTS *talker***, and stream the synthesized speech, frame-by-frame, into a [Pipecat](https://docs.pipecat.ai) voice pipeline (STT → LLM → TTS → audio).
+Run AlpinDale's [`qwen_megakernel`](https://github.com/AlpinDale/qwen_megakernel) (a single-launch CUDA decode kernel for Qwen3-0.6B, ~1000 tok/s on an RTX 5090) as the **decode backend for the Qwen3-TTS *talker***, and stream the synthesized speech into a [Pipecat](https://docs.pipecat.ai) voice pipeline (STT → LLM → TTS → audio).
 
-> **Status: work in progress.** Environment + baseline + reference pipeline are up and verified on an RTX 5090; the talker→kernel integration, streaming codec, Pipecat service, and benchmarks are being built.
+> **Status.** Megakernel drives the Qwen3-TTS talker end-to-end and produces real speech, validated on an RTX 5090 (hidden states match the reference at 0.9999 cosine). Benchmarks done. Streaming codec + Pipecat pipeline + live demo are the remaining work.
 
 ## What it does
 
@@ -12,63 +12,63 @@ Modern neural TTS is an autoregressive transformer (a "talker") that predicts di
 mic → STT → chat-LLM → [ Qwen3-TTS TTS service ] → audio → speaker
                           │
    text → inputs_embeds → ┌─ TALKER trunk (28-layer Qwen3)  ◄── runs on the MEGAKERNEL
-                          │     reads final hidden state via the kernel's `g_normalized` seam
+                          │     final hidden read via the kernel's `g_normalized` seam
                           ├─ codec_head (1024→3072) + sampling          (PyTorch)
                           ├─ code-predictor (5-layer, codebooks 1–15)   (PyTorch)
-                          └─ 12 Hz causal-ConvNet codec, streamed        (PyTorch) → 24 kHz PCM
+                          └─ 12 Hz causal-ConvNet codec                   (PyTorch) → 24 kHz PCM
 ```
 
 The megakernel replaces **only** the talker trunk. The code-predictor (the "codebook generator") and the codec decoder stay in PyTorch, as the task specifies.
 
-## Key technical findings (verified on hardware)
+## How the kernel serves as the talker trunk (no recompiles)
 
-- **Talker trunk shape == Qwen3-0.6B**, so the kernel needs **no resizing**: 28 layers, hidden 1024, 16 Q / 8 KV heads, head_dim 128, intermediate 3072, q/k-norm. Weight tensor names map 1:1 to the kernel's per-layer packing.
-- **mRoPE collapses to plain 1D RoPE** for text→speech (the talker's 3 position axes are equal; the interleaved-rope step is a no-op), so the only RoPE change is rebuilding the host cos/sin tables with **θ=1e6** — confirmed the kernel consumes host RoPE tables (no in-kernel θ).
-- **Sampling without kernel surgery:** the kernel writes the final post-RMSNorm hidden state to a host-visible tensor (`g_normalized`) *before* its in-kernel argmax. We read that hidden state and run `codec_head` + temperature/top-k/top-p sampling in PyTorch.
-- **Custom embeddings without recompiling:** point the kernel's `embed_weight` at a 1-row buffer holding the per-step `inputs_embeds` and pass `token_id=0` — the kernel reads our embedding directly.
+- **Talker trunk shape == Qwen3-0.6B** (28L / hidden 1024 / 16 Q / 8 KV / head_dim 128 / inter 3072, q/k-norm); weight tensor names map 1:1 to the kernel's per-layer packing — **no resizing**.
+- **mRoPE collapses to plain 1D RoPE** for text→speech (3 position axes equal; interleaved-rope is a no-op), so the only RoPE change is rebuilding the host cos/sin tables with **θ=1e6**.
+- **Sampling without kernel surgery:** read the post-RMSNorm hidden from the host-visible `g_normalized` buffer (before the kernel's argmax), run `codec_head` + sampling in PyTorch. (Greedy degenerates to silence — use the model's sampling.)
+- **Embedding injection:** write each step's `inputs_embeds` into `embed_weight` row 0 and call `step(token_id=0)`.
 
-## Hardware / environment
+## Validation
 
-- **RTX 5090** (Blackwell, `sm_120`). The kernel is bf16-only and Blackwell-tuned.
-- CUDA 13.0 toolkit, NVIDIA driver ≥ 575, PyTorch `2.9.1+cu130`. (Builds clean on CUDA 13 with `-arch=sm_120a`; baseline reproduced at ~1029 tok/s.)
-- `qwen-tts` package (`transformers==4.57.3`) for the reference pipeline, codec, and code-predictor.
+`talker/validate_talker_trunk.py` — kernel vs reference talker hidden states: **cosine 0.99991 (min 0.99979)** over 110 prefill positions, and ~0.9999 on every decode step. `talker/megakernel_talker.py` runs full kernel-driven synthesis.
+
+## Performance (measured, RTX 5090 / CUDA 13 / torch 2.9.1+cu130, bf16, batch 1)
+
+Full methodology + analysis in [`bench/results.md`](bench/results.md).
+
+| Metric | Value | Notes |
+|---|---|---|
+| Megakernel decode, isolated | 1029 tok/s, 0.97 ms/step | reproduced baseline |
+| Kernel as talker trunk (our path) | **1.08 ms/step (924/s)** | ~5× cheaper than the PyTorch trunk |
+| Per-stage: trunk / code-predictor / codec | 24% / **71%** / 5% | code-predictor dominates |
+| End-to-end RTF | **0.99 (ref) → 0.77 (kernel)** | batch 1, non-streaming |
+
+**Honest bottleneck analysis.** The megakernel makes the talker trunk ~5× cheaper, but end-to-end RTF is Amdahl-bounded: the **code-predictor (71%)** dominates and the kernel doesn't touch it. The obvious micro-opt (skipping the wasted full-vocab lm_head) is negligible (~0.1 ms/step). **The real lever is accelerating the code-predictor** — it's the same Qwen3 kernel family (5 layers, head_dim 128, θ=1e6) — plus streaming + `torch.compile`/CUDA-graphs. The brief's RTF<0.15 target is not reached (~0.77 here); reported transparently rather than hand-waved.
 
 ## Repo layout
 
 ```
-scripts/
-  reference_run.py    # run the stock PyTorch Qwen3-TTS-0.6B pipeline (baseline + ground truth)
-  inspect_weights.py  # dump talker/code-predictor weight tensor names + shapes
-talker/               # megakernel-backed talker decode  (in progress)
-codec/                # streaming 12 Hz codec decode      (in progress)
-pipecat_service/      # custom streaming TTS service       (in progress)
-bench/                # TTFC / RTF / tok-s measurement      (in progress)
+scripts/   reference_run.py, inspect_weights.py
+talker/    validate_talker_trunk.py (0.9999 match), megakernel_talker.py (kernel-driven synthesis)
+bench/     results.md, stage_benchmark.py, kernel_step_bench.py
+codec/     streaming 12 Hz codec        (in progress)
+pipecat_service/  streaming TTS service  (in progress)
 ```
 
-## Build / run (current)
+## Build / run
 
 ```bash
-# on an RTX 5090 box, CUDA 12.8+ devel image
+# RTX 5090 box, CUDA 12.8+ devel image
 uv venv && source .venv/bin/activate
-uv pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu130
-git clone https://github.com/AlpinDale/qwen_megakernel && uv pip install -e ./qwen_megakernel  # + transformers, ninja
+uv pip install torch==2.9.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu130
+git clone https://github.com/AlpinDale/qwen_megakernel   # + transformers, ninja, accelerate
 git clone https://github.com/QwenLM/Qwen3-TTS && uv pip install -e ./Qwen3-TTS
-python scripts/reference_run.py     # baseline synthesis (writes out_ref.wav)
+python scripts/reference_run.py                                  # baseline synthesis
+PYTHONPATH=./qwen_megakernel python talker/validate_talker_trunk.py   # 0.9999 hidden-state match
+PYTHONPATH=./qwen_megakernel python talker/megakernel_talker.py       # kernel-driven audio
 ```
-
-## Performance (to be filled with measured p50/p95)
-
-| Metric | Value | Notes |
-|---|---|---|
-| Megakernel decode (Qwen3-0.6B) | ~1029 tok/s, 0.97 ms/tok | reproduced baseline |
-| Reference full pipeline RTF | ~1.0 | stock PyTorch, sdpa, non-streaming (baseline to beat) |
-| TTFC | _tbd_ | time to first audio chunk |
-| Steady-state RTF | _tbd_ | gen time ÷ audio duration |
-
-Performance methodology and an honest bottleneck analysis (the talker is cheap at 12.5 Hz; the code-predictor dominates steady-state) will accompany the final numbers.
 
 ## Credits
 
 - [AlpinDale/qwen_megakernel](https://github.com/AlpinDale/qwen_megakernel) — the decode megakernel.
-- [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) — the open Qwen3-TTS models and reference code (Apache-2.0).
+- [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) — open Qwen3-TTS models + reference code (Apache-2.0).
 - [pipecat-ai/pipecat](https://github.com/pipecat-ai/pipecat) — real-time voice pipeline framework.
