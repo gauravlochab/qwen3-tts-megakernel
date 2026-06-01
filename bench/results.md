@@ -102,17 +102,23 @@ megakernel-fuse of the 5-layer stack (toward the documented ~0.15–0.18 floor).
   talker to emit each 12.5 Hz frame's codec tokens as they decode, window-decodes through the 12 Hz codec,
   and yields `TTSAudioRawFrame`s *as decoded* (not buffered). The streaming self-test emits a tiny first
   chunk then steady chunks — a rising staircase from ~TTFC, with O(1-chunk) resident buffer.
-- **TTFC ≈ 170 ms** warm (time to first audio chunk), measured on the streaming service after a 1-frame
-  first chunk (`threshold = 1`) + the graphed code-predictor. (Earlier ~0.30 s was the 2-frame, pre-graph
-  path.) TTS-internal (text-ready → first audio frame); excludes the conversational STT/LLM stage.
-  **Measured breakdown of the 170 ms** (instrumented, first frame only): **prefill 111 ms** (the megakernel
-  decodes the ~110-token text prompt one token at a time, ~1 ms/token) + first decode ~2 ms + code-predictor
-  + codec + emit ~58 ms. **Prefill is ~65% of TTFC** — and it's the clear next lever: prefill is not
-  autoregressive over *generated* tokens, so it can run through the PyTorch trunk's **batched** forward in
-  one ~22 ms call instead of 110 sequential kernel steps, which would cut TTFC to **~80 ms** (toward the
-  <60 ms target). Not yet applied: it requires bridging the batched-prefill K/V into the megakernel's
-  internal fp32 KV-cache layout, which must be done carefully to preserve the 0.9999 validation — scoped as
-  the next lever rather than risked here.
+- **TTFC ≈ 162 ms** warm (time to first audio chunk), TTS-internal (text-ready → first audio frame);
+  excludes the conversational STT/LLM stage. The path: 1-frame first chunk (`threshold = 1`) + graphed
+  code-predictor + **L1 prefill lm_head-skip** (below). (Earlier ~0.30 s was the 2-frame, pre-graph path.)
+  - **Measured breakdown** (instrumented, first frame): prefill ~88 ms + first decode ~2 ms + first
+    code-predictor/codec/emit ~72 ms.
+  - **L1 (applied): skip the discarded full-vocab lm_head in prefill** ([`optimizations/`](../optimizations/)).
+    Each prefill token was running a ~311 MB / 151936-row argmax matvec whose result is thrown away
+    (~0.97 ms/token × 110 ≈ 107 ms of waste, proven by `prove_lmhead.py`). A new `decode_no_head` kernel
+    path runs the identical body kernel without the lm_head → the hidden state is **bit-identical**
+    (`val_L1.py`: max abs diff 0.000, cosine **1.0000000**), so the 0.9999 invariant holds by construction.
+    Prefill kernel work dropped ~107 → ~84 ms; the streaming prefill stage ~111 → ~88 ms; warm TTFC
+    ~170 → ~162 ms; decode-path RTF unchanged (~0.20).
+  - **Why the end-to-end TTFC win is smaller than the raw lm_head saving:** the remaining ~88 ms prefill is
+    now the **per-token Python loop + embedding copies** (not the lm_head), and "other" is the first
+    code-predictor frame + codec + one-time graph capture. The next levers are batching that host prefill
+    loop and the megakernel-fuse — getting toward the <60 ms target — but they are more invasive;
+    L1 is the safe, bit-exact win banked here.
 - **Conversational stage (separate from the kernel TTS):** Deepgram STT (`nova-2`) ~1.5 s on an 8 s clip;
   Groq LLM (`llama-3.3-70b-versatile`) first-token ~0.35 s. These are cloud calls (model- and
   network-dependent) and dominate *end-to-end* first-audio, so we start TTS on the

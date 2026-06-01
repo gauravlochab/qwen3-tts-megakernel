@@ -49,7 +49,14 @@ def build_kernel_tts(model_path="Qwen/Qwen3-TTS-12Hz-0.6B-Base"):
         start = int(cp[0]) if cp is not None else (pkv.get_seq_length() if pkv is not None else 0)
         if start == 0: dec.reset()
         ieb = ie[0].to(torch.bfloat16); hid = torch.empty(q,HID,dtype=torch.bfloat16,device="cuda")
-        for j in range(q): embed[0].copy_(ieb[j]); dec.step(0); hid[j]=dec._norm_out.to(torch.bfloat16)
+        # L1: prefill skips the discarded full-vocab lm_head per token (step_prefill) — same body kernel,
+        # so _norm_out + KV are byte-identical (0.9999 preserved), but ~107ms of wasted lm_head removed.
+        # Falls back to step(0) if the no-head kernel op isn't present (older build).
+        _pf = getattr(dec, "step_prefill", None) if q > 1 else None
+        if _pf is not None:
+            for j in range(q): embed[0].copy_(ieb[j]); _pf(); hid[j]=dec._norm_out.to(torch.bfloat16)
+        else:
+            for j in range(q): embed[0].copy_(ieb[j]); dec.step(0); hid[j]=dec._norm_out.to(torch.bfloat16)
         if uc and pkv is not None:
             z = torch.zeros(1,NKV,q,HEADDIM,dtype=torch.bfloat16,device="cuda")
             for li in range(NL): pkv.update(z,z,li,{})

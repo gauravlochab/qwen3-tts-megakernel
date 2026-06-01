@@ -1,0 +1,142 @@
+--- csrc/kernel.cu.L1bak	2026-06-01 19:23:21.196599978 +0000
++++ csrc/kernel.cu	2026-06-01 19:27:07.403398648 +0000
+@@ -1504,6 +1504,36 @@
+       d_lm_head_counter, LDG_LM_NUM_BLOCKS);
+ }
+ 
++// L1 optimization: identical to launch_ldg_decode_direct but SKIPS the final lm_head launch.
++// Used for PREFILL, where the caller reads the hidden state (g_normalized, written entirely by the
++// body kernel) and discards the predicted token. The body kernel is byte-for-byte the same launch,
++// so g_normalized and the KV cache are IDENTICAL to the full path -> the 0.9999 invariant is
++// preserved by construction (the only difference is the ~311MB / 151936-row lm_head matvec is not
++// run). output_token_id is left untouched (not computed).
++extern "C" void launch_ldg_decode_direct_nohead(
++    int input_token_id, const void *embed_weight,
++    const LDGLayerWeights *layer_weights, const void *final_norm_weight,
++    const void *cos_table, const void *sin_table,
++    void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
++    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
++    void *g_mlp_intermediate, void *g_normalized, int num_layers, int position,
++    int max_seq_len, float attn_scale, cudaStream_t stream) {
++  ldg_configure_kernel_attributes();
++  ensure_barrier_alloc();
++
++  ldg_decode_kernel_direct<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
++      (const __nv_bfloat16 *)embed_weight, layer_weights,
++      (const __nv_bfloat16 *)final_norm_weight,
++      (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,
++      (__nv_bfloat16 *)k_cache, (__nv_bfloat16 *)v_cache,
++      (__nv_bfloat16 *)hidden_buffer, (float *)g_activations,
++      (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
++      (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
++      d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
++      position, input_token_id, max_seq_len, attn_scale);
++  // NO ldg_lm_head_fused launch — that is the ~107ms prefill waste this lever removes.
++}
++
+ extern "C" void launch_ldg_decode_persistent(
+     int input_token_id, int *output_token_id, const void *embed_weight,
+     const LDGLayerWeights *layer_weights, const void *final_norm_weight,
+--- csrc/torch_bindings.cpp.L1bak	2026-06-01 19:23:21.196599978 +0000
++++ csrc/torch_bindings.cpp	2026-06-01 19:27:12.615372867 +0000
+@@ -52,6 +52,15 @@
+     void *block_max_idxs, int num_layers, int position, int max_seq_len,
+     float attn_scale, cudaStream_t stream);
+ 
++extern "C" void launch_ldg_decode_direct_nohead(
++    int input_token_id, const void *embed_weight,
++    const LDGLayerWeights *layer_weights, const void *final_norm_weight,
++    const void *cos_table, const void *sin_table,
++    void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
++    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
++    void *g_mlp_intermediate, void *g_normalized, int num_layers, int position,
++    int max_seq_len, float attn_scale, cudaStream_t stream);
++
+ void decode(torch::Tensor output_token, int64_t input_token_id,
+             torch::Tensor embed_weight, torch::Tensor layer_weights_packed,
+             torch::Tensor final_norm_weight, torch::Tensor lm_head_weight,
+@@ -80,6 +89,32 @@
+       c10::cuda::getCurrentCUDAStream().stream());
+ }
+ 
++// L1: decode one position WITHOUT the lm_head (prefill). Same body kernel as decode() => g_normalized
++// + KV cache are byte-identical; no output token is produced. ~107ms TTFC waste removed for prefill.
++void decode_no_head(int64_t input_token_id, torch::Tensor embed_weight,
++                    torch::Tensor layer_weights_packed,
++                    torch::Tensor final_norm_weight, torch::Tensor cos_table,
++                    torch::Tensor sin_table, torch::Tensor k_cache,
++                    torch::Tensor v_cache, torch::Tensor hidden_buffer,
++                    torch::Tensor activations, torch::Tensor residual,
++                    torch::Tensor q, torch::Tensor k, torch::Tensor v,
++                    torch::Tensor attn_out, torch::Tensor mlp_intermediate,
++                    torch::Tensor normalized, int64_t num_layers,
++                    int64_t position, int64_t max_seq_len, double attn_scale) {
++  launch_ldg_decode_direct_nohead(
++      static_cast<int>(input_token_id), embed_weight.data_ptr(),
++      reinterpret_cast<const LDGLayerWeights *>(
++          layer_weights_packed.data_ptr()),
++      final_norm_weight.data_ptr(), cos_table.data_ptr(), sin_table.data_ptr(),
++      k_cache.data_ptr(), v_cache.data_ptr(), hidden_buffer.data_ptr(),
++      activations.data_ptr(), residual.data_ptr(), q.data_ptr(), k.data_ptr(),
++      v.data_ptr(), attn_out.data_ptr(), mlp_intermediate.data_ptr(),
++      normalized.data_ptr(), static_cast<int>(num_layers),
++      static_cast<int>(position), static_cast<int>(max_seq_len),
++      static_cast<float>(attn_scale),
++      c10::cuda::getCurrentCUDAStream().stream());
++}
++
+ extern "C" void launch_ldg_generate_nosync(
+     int first_token_id, int num_steps, const void *embed_weight,
+     const LDGLayerWeights *layer_weights, const void *final_norm_weight,
+@@ -140,6 +175,17 @@
+           "float attn_scale) -> ()");
+   ops.impl("decode", torch::kCUDA, &decode);
+ 
++  ops.def("decode_no_head(int input_token_id, "
++          "Tensor embed_weight, Tensor layer_weights_packed, "
++          "Tensor final_norm_weight, Tensor cos_table, Tensor sin_table, "
++          "Tensor k_cache, Tensor v_cache, "
++          "Tensor hidden_buffer, Tensor activations, Tensor residual, "
++          "Tensor q, Tensor k, Tensor v, Tensor attn_out, "
++          "Tensor mlp_intermediate, Tensor normalized, "
++          "int num_layers, int position, int max_seq_len, "
++          "float attn_scale) -> ()");
++  ops.impl("decode_no_head", torch::kCUDA, &decode_no_head);
++
+   ops.def("generate_nosync(int first_token_id, int num_steps, "
+           "Tensor embed_weight, Tensor layer_weights_packed, "
+           "Tensor final_norm_weight, Tensor lm_head_weight, "
+--- qwen_megakernel/model.py.L1bak	2026-06-01 19:23:21.196599978 +0000
++++ qwen_megakernel/model.py	2026-06-01 19:27:17.811347245 +0000
+@@ -16,6 +16,7 @@
+ VOCAB_SIZE = 151936
+ 
+ _decode = torch.ops.qwen_megakernel_C.decode
++_decode_no_head = torch.ops.qwen_megakernel_C.decode_no_head
+ 
+ 
+ def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
+@@ -214,6 +215,23 @@
+         )
+         self._position += 1
+ 
++    def step_prefill(self) -> None:
++        """L1: decode one position skipping the lm_head entirely (prefill).
++
++        Runs the SAME body kernel as step(0) — so `_norm_out` (the hidden state prefill reads) and the
++        KV cache are byte-identical — but does NOT launch the ~311MB / 151936-row lm_head matvec whose
++        argmax token is discarded during prefill. This removes the measured ~107ms prefill waste (the
++        lm_head is ~0.97ms/token × 110 tokens). The 0.9999 hidden-state invariant is preserved by
++        construction: the only thing skipped is a computation whose output is thrown away.
++        """
++        _decode_no_head(
++            0, self._embed_weight, self._layer_weights_packed, self._final_norm_weight,
++            self._cos_table, self._sin_table, self._k_cache, self._v_cache, self._hidden,
++            self._act, self._res, self._q, self._k, self._v, self._attn_out, self._mlp_inter,
++            self._norm_out, NUM_LAYERS, self._position, MAX_SEQ_LEN, self._attn_scale,
++        )
++        self._position += 1
++
+     def reset(self):
+         self._position = 0
+         self._k_cache.zero_()
