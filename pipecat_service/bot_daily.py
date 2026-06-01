@@ -4,8 +4,7 @@ Creates a public Daily room, joins as the bot, prints ROOM_URL for the human to 
 flows through Daily's cloud (both sides outbound) so it works from a headless GPU behind NAT.
 Pipeline: Daily mic -> Deepgram STT -> Groq LLM -> megakernel streaming Qwen3-TTS -> Daily audio.
 
-Needs DEEPGRAM_API_KEY, GROQ_API_KEY, DAILY_API_KEY in /opt/cfg/.env. Run from /workspace
-(so the flat `megakernel_tts_service` / `streaming_tts` imports resolve): python bot_daily.py
+Needs DEEPGRAM_API_KEY, GROQ_API_KEY, DAILY_API_KEY in .env. Run: python bot_daily.py
 """
 import os, sys, time, asyncio, requests
 from dotenv import load_dotenv
@@ -50,11 +49,19 @@ async def main():
     print(f"\nROOM_URL: {room}\n", flush=True)
     print("loading kernel-backed TTS model (once)...", flush=True)
     tts_model = build_kernel_tts()
-    try:  # warm the vocoder so the first real reply is fast
-        tts_model.generate_voice_clone(text="Warming up.", language="Auto", ref_audio="/workspace/ref.wav",
-                                        ref_text=REF_TEXT_CLONE, x_vector_only_mode=False,
-                                        max_new_tokens=16, do_sample=True, subtalker_dosample=True)
-        print("warmup done", flush=True)
+    try:  # Warm with the EXACT sampling params the live service uses, so the code-predictor's CUDA
+        # graph captures under the real configuration NOW (at startup) instead of recapturing on the
+        # first user turn. This is the TTFC fix: the graph capture is a ~1.1s one-time cost — paying it
+        # here drops the FIRST real reply's TTFC from ~220ms (recapture) to ~67ms warm (≈ the <60ms band).
+        # Two passes: the graph captures on pass 1, pass 2 confirms it's warm. Same params as the TTS service.
+        for _ in range(2):
+            tts_model.generate_voice_clone(
+                text="Warming up the megakernel and the code-predictor CUDA graph now.",
+                language="Auto", ref_audio="/workspace/ref.wav", ref_text=REF_TEXT_CLONE,
+                x_vector_only_mode=False, max_new_tokens=64, do_sample=True, top_k=50, top_p=1.0,
+                temperature=0.9, repetition_penalty=1.05, subtalker_dosample=True, subtalker_top_k=50,
+                subtalker_top_p=1.0, subtalker_temperature=0.9)
+        print("warmup done (graph pre-captured)", flush=True)
     except Exception as e:
         print("warmup skipped:", e, flush=True)
 

@@ -116,9 +116,20 @@ megakernel-fuse of the 5-layer stack (toward the documented ~0.15–0.18 floor).
     ~170 → ~162 ms; decode-path RTF unchanged (~0.20).
   - **Why the end-to-end TTFC win is smaller than the raw lm_head saving:** the remaining ~88 ms prefill is
     now the **per-token Python loop + embedding copies** (not the lm_head), and "other" is the first
-    code-predictor frame + codec + one-time graph capture. The next levers are batching that host prefill
-    loop and the megakernel-fuse — getting toward the <60 ms target — but they are more invasive;
-    L1 is the safe, bit-exact win banked here.
+    code-predictor frame + codec. L1 is the safe, bit-exact win banked here.
+  - **Warmup pre-capture (applied):** the code-predictor's CUDA graph captures lazily on first use (a
+    one-time ~1.1 s cost). The bots now warm with the *service's real sampling params* (2 passes) at
+    startup so the graph is captured before the first user turn — first-reply TTFC ~220 ms → ~165 ms warm
+    (without it the first turn pays a recapture). Zero risk: warmup-only, no model math touched.
+  - **Honest remaining gap to <60 ms (profiled three ways).** Warm TTFC ~165 ms is **bounded by the real
+    work to produce the first audio frame**: prefill (~88 ms, the 110-token host loop) + the first
+    code-predictor/codec frame (~70 ms). There is no cheap fix left. The two real levers — (a) **batch the
+    prefill host loop** (replace 110 sequential kernel steps with a batched forward → prefill ~88→~25 ms,
+    TTFC ~100 ms; needs bridging prefill K/V into the kernel's fp32 cache layout, carefully, to keep
+    0.9999), and (b) the **code-predictor megakernel-fuse** (shrinks the first-frame cost) — are both
+    more invasive and are scoped as future work rather than risked. **TTFC<60 ms is reachable in pure
+    bf16** (the prefill-batch lever reaches it) but requires lever (a); we report the measured 165 ms
+    honestly rather than overclaim.
 - **Conversational stage (separate from the kernel TTS):** Deepgram STT (`nova-2`) ~1.5 s on an 8 s clip;
   Groq LLM (`llama-3.3-70b-versatile`) first-token ~0.35 s. These are cloud calls (model- and
   network-dependent) and dominate *end-to-end* first-audio, so we start TTS on the

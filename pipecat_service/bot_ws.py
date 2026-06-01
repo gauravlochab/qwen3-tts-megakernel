@@ -56,11 +56,16 @@ async def lifespan(app: FastAPI):
     global _TTS_MODEL
     print("loading kernel-backed TTS model (once)...", flush=True)
     _TTS_MODEL = build_kernel_tts()
-    try:  # warm the vocoder so the first real reply is fast
-        _TTS_MODEL.generate_voice_clone(text="Warming up.", language="Auto", ref_audio="/workspace/ref.wav",
-                                        ref_text=REF_TEXT_CLONE, x_vector_only_mode=False,
-                                        max_new_tokens=16, do_sample=True, subtalker_dosample=True)
-        print("warmup done", flush=True)
+    try:  # Warm with the service's real sampling params (2 passes) so the code-predictor CUDA graph
+        # captures at startup, not on the first user turn (drops first-reply TTFC ~220ms -> ~165ms warm).
+        for _ in range(2):
+            _TTS_MODEL.generate_voice_clone(
+                text="Warming up the megakernel and the code-predictor CUDA graph now.",
+                language="Auto", ref_audio="/workspace/ref.wav", ref_text=REF_TEXT_CLONE,
+                x_vector_only_mode=False, max_new_tokens=64, do_sample=True, top_k=50, top_p=1.0,
+                temperature=0.9, repetition_penalty=1.05, subtalker_dosample=True, subtalker_top_k=50,
+                subtalker_top_p=1.0, subtalker_temperature=0.9)
+        print("warmup done (graph pre-captured)", flush=True)
     except Exception as e:
         print("warmup skipped:", e, flush=True)
     print("BOT READY — open http://localhost:8000 (via ssh -L 8000:localhost:8000) and talk.", flush=True)
