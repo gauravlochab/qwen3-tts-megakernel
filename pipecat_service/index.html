@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Megakernel Qwen3-TTS — Local Voice Agent</title>
+<style>
+  :root { --bg:#0b0f14; --panel:#121922; --ink:#e6edf3; --mut:#8b98a5; --acc:#3fb950; --acc2:#1f6feb; --warn:#d29922; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  .wrap { max-width:760px; margin:0 auto; padding:28px 20px 60px; }
+  h1 { font-size:20px; margin:0 0 2px; }
+  .sub { color:var(--mut); font-size:13px; margin:0 0 22px; }
+  .card { background:var(--panel); border:1px solid #1e2733; border-radius:12px; padding:18px; margin-bottom:16px; }
+  .row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  button { font:inherit; font-weight:600; border:0; border-radius:9px; padding:11px 18px; cursor:pointer; color:#fff; }
+  #connect { background:var(--acc2); }
+  #connect.connected { background:#30363d; }
+  #mic { background:#30363d; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .pill { display:inline-flex; align-items:center; gap:7px; font-size:13px; color:var(--mut); }
+  .dot { width:9px; height:9px; border-radius:50%; background:#444; transition:background .2s; }
+  .dot.on { background:var(--acc); box-shadow:0 0 8px var(--acc); }
+  .dot.speak { background:var(--warn); box-shadow:0 0 10px var(--warn); }
+  #log { height:300px; overflow-y:auto; background:#0d1117; border:1px solid #1e2733; border-radius:10px; padding:14px; font-size:14px; }
+  .msg { margin:0 0 10px; padding:8px 11px; border-radius:9px; max-width:85%; white-space:pre-wrap; word-wrap:break-word; }
+  .you { background:#16324a; margin-left:auto; }
+  .bot { background:#16261a; }
+  .meta { color:var(--mut); font-size:12px; }
+  code { background:#0d1117; padding:2px 6px; border-radius:5px; color:#79c0ff; font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Megakernel Qwen3-TTS — Local Voice Agent</h1>
+  <p class="sub">Browser ↔ headless RTX 5090 over a WebSocket (TCP, <code>ssh -L</code>-forwarded). No Daily, no cloud relay. Talker decoder runs on AlpinDale's CUDA megakernel.</p>
+
+  <div class="card">
+    <div class="row">
+      <button id="connect">Connect</button>
+      <button id="mic" disabled>Mute mic</button>
+      <span class="pill"><span id="dot" class="dot"></span><span id="state">disconnected</span></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="meta" style="margin-bottom:8px">Conversation</div>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+// Plain (non-module) script so the page is ALWAYS interactive immediately. The heavy bundle
+// (/pcbundle.js, ~720KB, one deduped client-js copy -> fixes "Class constructor E ... without 'new'")
+// is lazy-imported only on the first Connect click, so a slow/blocking import can never freeze the
+// page on load. All work is wrapped in try/catch with visible status.
+let PipecatClient, WebSocketTransport, ProtobufFrameSerializer, _libLoaded = false;
+async function loadLib() {
+  if (_libLoaded) return;
+  const m = await import("/pcbundle.js");
+  ({ PipecatClient, WebSocketTransport, ProtobufFrameSerializer } = m);
+  _libLoaded = true;
+}
+
+const $ = (id) => document.getElementById(id);
+const logEl = $("log"), dot = $("dot"), stateEl = $("state");
+const connectBtn = $("connect"), micBtn = $("mic");
+
+function setState(s, cls) { stateEl.textContent = s; dot.className = "dot" + (cls ? " " + cls : ""); }
+function add(role, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + (role === "you" ? "you" : "bot");
+  d.textContent = text;
+  logEl.appendChild(d); logEl.scrollTop = logEl.scrollHeight;
+  return d;
+}
+
+let client = null, connected = false, micOn = true;
+let curUser = null, curBot = null;
+
+function makeClient() {
+  const c = new PipecatClient({
+    transport: new WebSocketTransport({
+      serializer: new ProtobufFrameSerializer(),
+      recorderSampleRate: 16000,
+      playerSampleRate: 24000,
+    }),
+    enableMic: true,
+    enableCam: false,
+    callbacks: {
+      onConnected: () => { connected = true; setState("connected", "on"); connectBtn.textContent = "Disconnect"; connectBtn.classList.add("connected"); micBtn.disabled = false; },
+      onDisconnected: () => { connected = false; setState("disconnected"); connectBtn.textContent = "Connect"; connectBtn.classList.remove("connected"); micBtn.disabled = true; },
+      onBotReady: () => setState("bot ready", "on"),
+      onBotStartedSpeaking: () => setState("bot speaking", "speak"),
+      onBotStoppedSpeaking: () => setState(connected ? "connected" : "disconnected", connected ? "on" : ""),
+      onUserTranscript: (d) => {
+        if (!d || !d.text) return;
+        if (d.final) { add("you", d.text); curUser = null; }
+        else { if (!curUser) curUser = add("you", d.text); curUser.textContent = d.text; }
+      },
+      onBotTranscript: (d) => {
+        if (!d || !d.text) return;
+        if (!curBot) curBot = add("bot", d.text); else curBot.textContent += d.text;
+      },
+      onBotLlmStarted: () => { curBot = null; },
+      onError: (e) => add("bot", "⚠️ " + (e && e.message ? e.message : JSON.stringify(e))),
+    },
+  });
+  return c;
+}
+
+connectBtn.onclick = async () => {
+  if (connected) { try { await client.disconnect(); } catch (e) {} return; }
+  try {
+    setState("loading…");
+    connectBtn.disabled = true;
+    await loadLib();                 // lazy-load the bundle on first click
+    setState("connecting…");
+    client = makeClient();
+    const wsUrl = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+    await client.connect({ wsUrl });
+  } catch (e) {
+    setState("error"); add("bot", "⚠️ connect failed: " + (e && e.message ? e.message : e));
+    console.error(e);
+  } finally {
+    connectBtn.disabled = false;
+  }
+};
+
+micBtn.onclick = () => {
+  if (!client) return;
+  micOn = !micOn;
+  try { client.enableMic(micOn); } catch (e) {}
+  micBtn.textContent = micOn ? "Mute mic" : "Unmute mic";
+};
+
+// surface anything that would otherwise silently wedge the tab
+window.addEventListener("unhandledrejection", (ev) => {
+  setState("error"); add("bot", "⚠️ " + (ev.reason && ev.reason.message ? ev.reason.message : ev.reason));
+});
+setState("ready — click Connect");
+</script>
+</body>
+</html>
