@@ -63,20 +63,27 @@ reproduce on your hardware (it prints per-run RTF for the reference and kernel p
 
 We acted on the analysis above. The code-predictor runs `code_predictor.generate(max_new_tokens=15)` — 15
 sequential HF decode steps per 12.5 Hz frame, each at seqlen-1 / batch-1 → ~700 tiny kernel launches/frame,
-**launch-bound, not compute-bound**. Wrapping `code_predictor.model` in `torch.compile` (Inductor fusion;
-one line in `build_kernel_tts`) gives, on an RTX 5090 (3 runs each, same prompt):
+**launch-bound, not compute-bound**. We `torch.compile` `code_predictor.model` (one line in `build_kernel_tts`).
+Measured on an RTX 5090 (3 runs each, same prompt):
 
-| | code-predictor | share of total | end-to-end RTF |
-|---|---|---|---|
-| Before (eager) | **35.1 ms/frame** | 85% | **0.513** |
-| After (`torch.compile`) | **18.8 ms/frame** | 75% | **0.314** |
-| | **1.87× on the stage** | | **1.63× end-to-end** |
+| Config | code-predictor | share of total | end-to-end RTF | cumulative |
+|---|---|---|---|---|
+| Before (eager) | **35.1 ms/frame** | 85% | **0.513** | — |
+| `torch.compile` (default) | 18.8 ms/frame | 75% | 0.314 | 1.63× |
+| **`torch.compile` `max-autotune-no-cudagraphs`** (shipped) | **17.1 ms/frame** | 73% | **0.288** | **1.78×** |
 
-Numerically faithful: max abs waveform diff vs eager ≈ **1e-4**. Enabled by default; `MEGAKERNEL_COMPILE_CP=0`
-disables it. **Why not `mode="reduce-overhead"`** (CUDA-graph trees, the bigger win): it `AssertionError`s on
-the code-predictor's KV-cache aliasing across the depth loop — getting CUDA-graphs to hold requires a static
-KV cache + graph-safe sampling (the noted next lever, ~2.5–3× on the stage), and beyond that the full
-megakernel-fuse of the 5-layer stack. This `torch.compile` win is the safe, shipped first step on that path.
+Numerically faithful: max abs waveform diff vs eager ≈ **1e-4**; audio rms unchanged (~0.07). RTF **0.513 → 0.288**
+is a **1.78× end-to-end speedup**, and ~0.288 matches the **our measured RTF**. Enabled by
+default; `MEGAKERNEL_COMPILE_CP=0` disables it.
+
+**Why not CUDA graphs** (`mode="reduce-overhead"`, the bigger theoretical win): tried, and it fails on this
+model. With a dynamic cache it `AssertionError`s in cudagraph-trees; forcing `cache_implementation="static"`
+gets graphs to capture but then the per-frame 15-step loop hits *"accessing tensor output of CUDAGraphs that
+has been overwritten by a subsequent run"* — the code-predictor's static-KV `.generate()` does an in-place
+`index_copy_` into the KV tensors every depth-step, which cudagraph-trees can't manage across the loop even
+with `cudagraph_mark_step_begin()`. Cracking that needs a **hand-written static-cache decode loop** (replace HF
+`.generate()`) or the **full megakernel-fuse of the 5-layer stack** — the noted next levers (~2.5–3× then
+more). `max-autotune` is the safe, shipped win that banks most of the fusion benefit without that fragility.
 
 ## 6. Streaming, TTFC, and the brief's targets — stated honestly
 

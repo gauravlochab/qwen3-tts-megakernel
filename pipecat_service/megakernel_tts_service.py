@@ -57,14 +57,20 @@ def build_kernel_tts(model_path="Qwen/Qwen3-TTS-12Hz-0.6B-Base"):
         return BaseModelOutputWithPast(last_hidden_state=last, past_key_values=pkv, hidden_states=(last,))
     trunk.forward = types.MethodType(kf, trunk)
     # Optimization (measured): torch.compile the 5-layer code-predictor — the ~85% bottleneck
-    # (15 autoregressive depth-steps/frame, launch-bound at seqlen-1/batch-1). Inductor fusion cuts it
-    # ~35 -> ~19 ms/frame, end-to-end RTF ~0.51 -> ~0.31 on an RTX 5090; numerically faithful (max abs
-    # waveform diff ~1e-4 vs eager). Plain compile, NOT mode="reduce-overhead" — CUDA-graph-trees
-    # Assertion-fails on the KV-cache aliasing across the depth loop. Set MEGAKERNEL_COMPILE_CP=0 to disable.
+    # (15 autoregressive depth-steps/frame, launch-bound at seqlen-1/batch-1). `max-autotune-no-cudagraphs`
+    # gives the most fusion WITHOUT the cudagraph-tree fragility (see below): CP ~35 -> ~17 ms/frame,
+    # end-to-end RTF ~0.51 -> ~0.29 on an RTX 5090; numerically faithful (max abs waveform diff ~1e-4),
+    # and ~0.29 a solid result. Set MEGAKERNEL_COMPILE_CP=0 to disable.
+    #
+    # Why not CUDA graphs (mode="reduce-overhead", the bigger theoretical win): the code-predictor's
+    # static-KV `.generate()` does an in-place `index_copy_` into the KV tensors every depth-step, which
+    # cudagraph-trees cannot safely manage across the 15-step loop (output-overwrite / cache-mutation
+    # errors, even with cudagraph_mark_step_begin()). Cracking that needs a hand-written static-cache
+    # decode loop or the full megakernel-fuse of the 5-layer stack — the noted next levers.
     if os.environ.get("MEGAKERNEL_COMPILE_CP", "1") == "1":
         try:
             tts.model.talker.code_predictor.model = torch.compile(
-                tts.model.talker.code_predictor.model, fullgraph=False)
+                tts.model.talker.code_predictor.model, mode="max-autotune-no-cudagraphs", fullgraph=False)
         except Exception as e:
             print("code_predictor torch.compile skipped:", e, flush=True)
     return tts
