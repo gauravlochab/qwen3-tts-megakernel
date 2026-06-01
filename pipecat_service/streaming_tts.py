@@ -5,6 +5,11 @@ worker thread; the consumer windows-decodes via the model's own speech_tokenizer
 token mapping) with a left-context overlap (trimmed), yielding TTSAudioRawFrame per chunk.
 This satisfies the brief's "push chunks as they're decoded, do NOT buffer the full utterance."
 
+Handoff: the worker (generation) thread hands frames to the asyncio consumer via an asyncio.Queue
+fed with loop.call_soon_threadsafe(put_nowait, ...) and drained with `await q.get()`. This avoids a
+per-frame ThreadPoolExecutor dispatch (the old `await loop.run_in_executor(None, q.get)` woke a pool
+thread for every frame, adding latency + run-to-run jitter on the first chunk / TTFC).
+
 Over-generation note: the base Qwen3-TTS model rambles past EOS on certain text + reference-voice
 combinations. The pure-PyTorch reference does this IDENTICALLY (same texts cap at the same length),
 so it is NOT a kernel artifact -- the kernel reproduces the reference to ~0.9999 cosine (a
@@ -33,22 +38,25 @@ class MegakernelStreamingTTS(TTSService):
         self._talker = tts.model.talker
         self._eos = int(getattr(self._talker.config, "codec_eos_token_id", -1))
         self._ref_audio, self._ref_text = ref_audio, ref_text
-        # The model's intended sampling defaults + a max_new_tokens safety cap.
+        # The model's INTENDED sampling (matches the official example) + a max_new_tokens safety cap.
         # (Tightening rep_penalty/temperature was tried and HURT quality -- caused repetition collapse;
         # over-generation on some texts is a base-model trait, not fixable by degrading sampling.)
         self._gen = dict(max_new_tokens=200, do_sample=True, top_k=50, top_p=1.0, temperature=0.9,
                          repetition_penalty=1.05, subtalker_dosample=True, subtalker_top_k=50,
                          subtalker_top_p=1.0, subtalker_temperature=0.9)
         self._q = None
+        self._loop = None
         svc = self
         def _hook(module, inputs, output):  # forward hook: does not alter forward signature
             try:
                 hs = getattr(output, "hidden_states", None)
                 codec_ids = hs[1] if isinstance(hs, (tuple, list)) and len(hs) > 1 else None
-                if codec_ids is not None and svc._q is not None:
+                q, loop = svc._q, svc._loop
+                if codec_ids is not None and q is not None and loop is not None:
                     ids = codec_ids.detach().reshape(-1)
                     if ids.numel() == svc._talker.config.num_code_groups:
-                        svc._q.put(ids.to("cpu"))
+                        # producer runs in the worker thread -> hand to the loop thread-safely
+                        loop.call_soon_threadsafe(q.put_nowait, ids.to("cpu"))
             except Exception:
                 pass
         self._talker.register_forward_hook(_hook)
@@ -63,17 +71,19 @@ class MegakernelStreamingTTS(TTSService):
             self._tts.generate_voice_clone(text=text, language="Auto", ref_audio=self._ref_audio,
                                            ref_text=self._ref_text, x_vector_only_mode=False, **self._gen)
         finally:
-            self._q.put(_SENTINEL)
+            loop, q = self._loop, self._q
+            if loop is not None and q is not None:
+                loop.call_soon_threadsafe(q.put_nowait, _SENTINEL)
 
     async def run_tts(self, text, context_id):
-        self._q = queue.Queue()
-        loop = asyncio.get_event_loop()
+        self._loop = asyncio.get_event_loop()
+        self._q = asyncio.Queue()
         torch.manual_seed(0)
-        gen_fut = loop.run_in_executor(None, self._run_generation, text)
+        gen_fut = self._loop.run_in_executor(None, self._run_generation, text)
         await self.start_ttfb_metrics()
         frames, decoded, first, done = [], 0, True, False
         while not done:
-            item = await loop.run_in_executor(None, self._q.get)
+            item = await self._q.get()                 # native asyncio wake, no per-frame threadpool
             if item is _SENTINEL:
                 done = True
             elif self._eos >= 0 and int(item[0]) == self._eos:
@@ -81,7 +91,7 @@ class MegakernelStreamingTTS(TTSService):
             else:
                 frames.append(item)
             ready = len(frames) - decoded
-            threshold = 1 if first else CHUNK_FRAMES   # 1-frame first chunk -> lowest TTFC (codec warm-decode is ~flat in window size); measured warm TTFC ~170 ms
+            threshold = 1 if first else CHUNK_FRAMES   # 1-frame first chunk -> lowest TTFC (codec warm-decode is window-size-flat ~20ms)
             if (ready >= threshold) or (done and ready > 0):
                 start = max(0, decoded - LEFT_CTX)
                 wav = self._decode_window(frames[start:len(frames)])
@@ -95,6 +105,7 @@ class MegakernelStreamingTTS(TTSService):
                     yield TTSAudioRawFrame(audio=audio, sample_rate=SR, num_channels=1, context_id=context_id)
         await gen_fut
         self._q = None
+        self._loop = None
 
 
 async def _selftest():

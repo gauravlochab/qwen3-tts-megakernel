@@ -23,10 +23,11 @@ KV cache are byte-for-byte the same. Validated (`val_L1.py`): per-token hidden s
 healthy; decode-path RTF unchanged (~0.20).
 
 **Measured impact (RTX 5090).** Isolated prefill kernel: ~107 ms → ~84 ms of kernel work removed; in the
-streaming path, the prefill stage dropped ~111 ms → ~88 ms and warm TTFC ~170 ms → ~162 ms. The
-end-to-end TTFC win is smaller than the raw kernel saving because the remaining prefill time is the
-per-token Python loop + first-frame code-predictor/codec, not the lm_head — those are the next levers
-(batch the prefill host loop; the megakernel-fuse).
+streaming path, the prefill stage dropped ~111 ms → ~88 ms and warm TTFC ~170 ms → ~162 ms. L1 is the
+bit-exact first step; its end-to-end TTFC win is smaller than the raw kernel saving because the remaining
+prefill time was the per-token host loop, not the lm_head. Those larger levers were since closed — a
+batched-prefill KV-bridge (per-token loop → one forward, 0.9999) and a lock-free `asyncio.Queue` streaming
+handoff — taking warm TTFC to **~58 ms median** (see [`bench/results.md`](../bench/results.md) §6).
 
 ## How to apply (on the box, after cloning the upstream kernel)
 

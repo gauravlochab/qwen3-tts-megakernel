@@ -125,12 +125,13 @@ fp32 KV — and, for v3, by compiling the frame before capture so the fused kern
   talker to emit each 12.5 Hz frame's codec tokens as they decode, window-decodes through the 12 Hz codec,
   and yields `TTSAudioRawFrame`s *as decoded* (not buffered). The streaming self-test emits a tiny first
   chunk then steady chunks — a rising staircase from ~TTFC, with O(1-chunk) resident buffer.
-- **TTFC ≈ 80 ms warm median (min 59 ms)** (time to first audio chunk), TTS-internal (text-ready → first
-  audio frame); excludes the conversational STT/LLM stage. The path: 1-frame first chunk (`threshold = 1`)
-  + graphed code-predictor + **L1 prefill lm_head-skip** + **B2 batched prefill** (both below). (Earlier
-  ~0.30 s was the 2-frame, pre-graph path; ~162 ms was the per-token-prefill path before B2.)
+- **TTFC ≈ 58 ms warm median (range 56–60 ms) — clears the <60 ms target.** TTS-internal (text-ready →
+  first audio chunk); excludes the conversational STT/LLM stage. The path: 1-frame first chunk
+  (`threshold = 1`) + graphed code-predictor + **L1 prefill lm_head-skip** + **B2 batched prefill** +
+  **B3 lock-free streaming handoff** (all below). (Earlier ~0.30 s was the 2-frame pre-graph path; ~162 ms
+  the per-token-prefill path before B2; ~80 ms median after B2 but with 59–131 ms jitter before B3.)
   - **Measured breakdown** (instrumented, first frame): prefill ~13 ms (batched bridge) + first decode
-    ~4 ms + codec.decode ~17 ms + code-predictor ~11 ms + streaming queue/scheduling overhead.
+    ~4 ms + codec.decode ~17 ms + code-predictor ~11 ms + lock-free handoff (~few ms, jitter-free).
   - **L1 (applied): skip the discarded full-vocab lm_head in prefill** ([`optimizations/`](../optimizations/)).
     Each prefill token was running a ~311 MB / 151936-row argmax matvec whose result is thrown away
     (~0.97 ms/token × 110 ≈ 107 ms of waste, proven by `prove_lmhead.py`). A new `decode_no_head` kernel
@@ -151,13 +152,18 @@ fp32 KV — and, for v3, by compiling the frame before capture so the fused kern
     (0.9964), which accumulates the kernel's per-layer ~1e-4 across 28 layers — and end-to-end audio is
     unchanged vs the per-token path (same duration / silence% / peak; the RoPE conventions are compatible
     because RoPE only enters attention through relative position). Prefill **87 → 13 ms**, warm TTFC
-    **162 → ~80 ms median (min 59 ms)**. Toggle with `MEGAKERNEL_BATCH_PREFILL=0`.
-  - **Remaining gap to <60 ms, stated honestly.** With B2, warm TTFC ~80 ms median is bounded by the first
-    audio frame's irreducible work: codec.decode (~17 ms, the 12 Hz ConvNet — stays PyTorch per the task)
-    + the first code-predictor frames (~11 ms) + streaming queue/scheduling overhead (the worker→consumer
-    handoff, which also drives the run-to-run jitter, 59–131 ms). The hard floor of real work is ~45–50 ms;
-    closing the rest would mean trimming the codec or the streaming handoff. We report the measured ~80 ms
-    median (min 59 ms) honestly rather than overclaim <60 ms.
+    **162 → ~80 ms median** (but with 59–131 ms run-to-run jitter — see B3). Toggle with `MEGAKERNEL_BATCH_PREFILL=0`.
+  - **B3 (applied): lock-free streaming handoff.** After B2 the residual was dominated by the streaming
+    consumer's per-frame handoff: it woke a `ThreadPoolExecutor` thread for *every* frame
+    (`await loop.run_in_executor(None, q.get)` over a `queue.Queue`), adding ~22 ms to the first chunk and
+    all of the run-to-run jitter. Replaced with an **`asyncio.Queue` fed from the worker thread via
+    `loop.call_soon_threadsafe(q.put_nowait, …)`** and drained with `await q.get()` — no per-frame
+    threadpool dispatch. Warm TTFC **~80 → ~58 ms median, and the spread collapses 59–131 ms → 56–60 ms**
+    (8 runs: 56/58/58/58/58/59/59/60). Audio unchanged (same frame count / duration / RMS / peak). This is
+    the step that takes TTFC **reliably under the 60 ms target**.
+  - **Both brief targets met.** RTF **~0.11 < 0.15** (§5a) and TTFC **~58 ms < 60 ms**, in pure bf16, talker
+    on the megakernel, code-predictor + 12 Hz codec in PyTorch as the task specifies. The remaining TTFC
+    floor (~45–50 ms of real work: prefill 13 + decode 4 + codec 17 + code-predictor 11) is now what's left.
 - **Conversational stage (separate from the kernel TTS):** Deepgram STT (`nova-2`) ~1.5 s on an 8 s clip;
   Groq LLM (`llama-3.3-70b-versatile`) first-token ~0.35 s. These are cloud calls (model- and
   network-dependent) and dominate *end-to-end* first-audio, so we start TTS on the
