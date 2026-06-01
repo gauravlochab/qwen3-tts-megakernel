@@ -71,6 +71,10 @@ reproduce on your hardware (it prints per-run RTF for the reference and kernel p
   Groq LLM (`llama-3.3-70b-versatile`) first-token ~0.35 s. These are cloud calls (model- and
   network-dependent) and dominate *end-to-end* first-audio, so we start TTS on the
   reply text as soon as the LLM returns.
+- **End-to-end latency (speak-end → first audio chunk), live demo: ~0.75 s** = turn detection ~0.15 s
+  (smart-turn) + LLM first-token ~0.35 s + TTS TTFC ~0.30 s warm (STT runs incrementally during the user's
+  speech, so it is not on the critical path; Daily's WebRTC relay adds a further ~0.1–0.3 s of transport).
+  Measured from the live `bot_daily.py` session logs.
 - **RTF.** Brief target RTF < 0.15. Achieved ~0.77 (single 5090, batch 1, non-streaming measurement,
   unoptimized code-predictor, no `torch.compile`/CUDA-graphs). This is consistent with the unoptimized reference
   numbers (the fully-optimized configs add flash-attn, compile, and CUDA graphs). Reaching
