@@ -4,11 +4,12 @@ Creates a public Daily room, joins as the bot, prints ROOM_URL for the human to 
 flows through Daily's cloud (both sides outbound) so it works from a headless GPU behind NAT.
 Pipeline: Daily mic -> Deepgram STT -> Groq LLM -> megakernel streaming Qwen3-TTS -> Daily audio.
 
-Needs DEEPGRAM_API_KEY, GROQ_API_KEY, DAILY_API_KEY in .env. Run: python bot_daily.py
+Needs DEEPGRAM_API_KEY, GROQ_API_KEY, DAILY_API_KEY in /opt/cfg/.env. Run from /workspace
+(so the flat `megakernel_tts_service` / `streaming_tts` imports resolve): python bot_daily.py
 """
 import os, sys, time, asyncio, requests
 from dotenv import load_dotenv
-load_dotenv("/workspace/.env")
+load_dotenv("/opt/cfg/.env")
 sys.path.insert(0, "/workspace")
 
 from pipecat.pipeline.pipeline import Pipeline

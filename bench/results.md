@@ -1,8 +1,11 @@
 # Performance results
 
-**Setup.** Single RTX 5090 (Blackwell, sm_120), CUDA 13.0, PyTorch 2.9.1+cu130, bf16, batch size 1.
-(The pipeline also runs on CUDA 12.9 / torch 2.9.1+cu128 — see `SETUP.md`; trunk/RTF numbers below
-were measured on the cu130 box.) Sampling: `do_sample=True, temperature=0.9, top_k=50,
+**Setup.** **Box A (canonical):** single RTX 5090 (Blackwell, sm_120, 32 GB), CUDA 13.0, **NVIDIA
+driver 575.64.03**, PyTorch 2.9.1+cu130, bf16, batch size 1. The headline trunk/RTF numbers below are
+from box A. **Box B (cross-check only):** a second RTX 5090, CUDA 12.9 / torch 2.9.1+cu128 — used only
+to confirm the *finding* reproduces (see §4); cu130 is the canonical reproduction target.
+Conversational stage: Deepgram STT model `nova-2`, Groq LLM `llama-3.3-70b-versatile`.
+Sampling: `do_sample=True, temperature=0.9, top_k=50,
 repetition_penalty=1.05` (and the same for the sub-talker / code-predictor). Greedy decoding
 degenerates to silence (a known codec-LM failure mode), so sampling is used. Warmup runs precede all
 timed runs. End-to-end times use `torch.cuda.synchronize` barriers; per-stage uses CUDA events; the
@@ -38,8 +41,8 @@ The megakernel replaces the talker trunk (≈814 ms → ≈165 ms for a ~152-ste
 which moves end-to-end RTF from ~0.99 to ~0.77. The gain is **Amdahl-bounded**: the talker was never the
 wall.
 
-**Reproduced on a second box** (CUDA 12.9 / torch 2.9.1+cu128, `bench/stage_benchmark.py`): RTF
-**~0.84 (reference) → ~0.52 (megakernel)**, 3 runs each. Absolute RTF is box-dependent (CUDA/driver,
+**Reproduced on box B** (a second RTX 5090, CUDA 12.9 / torch 2.9.1+cu128, `bench/stage_benchmark.py`):
+RTF **~0.84 (reference) → ~0.52 (megakernel)**, 3 runs each. Absolute RTF is box-dependent (CUDA/driver,
 clocks), but the **finding is identical on both machines**: the megakernel materially lowers end-to-end
 RTF, and the code-predictor remains the dominant residual cost. Run `bench/stage_benchmark.py` to
 reproduce on your hardware (it prints per-run RTF for the reference and kernel paths).
@@ -64,8 +67,9 @@ reproduce on your hardware (it prints per-run RTF for the reference and kernel p
   chunk then steady chunks — a rising staircase from ~TTFC, with O(1-chunk) resident buffer.
 - **TTFC ≈ 0.30 s** (time to first audio chunk), measured on the streaming service (warm). This is
   TTS-internal (text-ready → first audio frame); it does not include the conversational STT/LLM stage.
-- **Conversational stage (separate from the kernel TTS):** Deepgram STT ~1.5 s on an 8 s clip; Groq LLM
-  first-token ~0.35 s. These are cloud calls and dominate *end-to-end* first-audio, so we start TTS on the
+- **Conversational stage (separate from the kernel TTS):** Deepgram STT (`nova-2`) ~1.5 s on an 8 s clip;
+  Groq LLM (`llama-3.3-70b-versatile`) first-token ~0.35 s. These are cloud calls (model- and
+  network-dependent) and dominate *end-to-end* first-audio, so we start TTS on the
   reply text as soon as the LLM returns.
 - **RTF.** Brief target RTF < 0.15. Achieved ~0.77 (single 5090, batch 1, non-streaming measurement,
   unoptimized code-predictor, no `torch.compile`/CUDA-graphs). This is consistent with the unoptimized reference

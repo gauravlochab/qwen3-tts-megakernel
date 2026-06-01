@@ -5,7 +5,8 @@ vast.ai instance. (Born from a painful recovery after an instance died mid-proje
 
 ## 0. Pick a good box
 - **RTX 5090 (32 GB), Blackwell / sm_120, CUDA 13.0**, `-devel` image (needs `nvcc` for the
-  megakernel JIT build).
+  megakernel JIT build). **NVIDIA driver ≥ 570** (measured on `575.64.03`), **≥ 60 GB disk**
+  (weights ~2 GB + venv/torch ~8 GB + JIT cache + headroom).
 - **Check network!** A degraded box makes the live demo unusable (cloud STT/LLM/Daily calls
   pay multi-second penalties). After SSHing in, sanity-check:
   ```
@@ -13,11 +14,35 @@ vast.ai instance. (Born from a painful recovery after an instance died mid-proje
   ```
   Expect < ~0.3 s. If it's seconds, destroy and rent another.
 
-## 1. Get the code + weights onto the box (`/workspace`)
-- `qwen_megakernel/` (AlpinDale's kernel), `Qwen3-TTS/` (cloned repo, editable), `ref.wav`,
-  and the `pipecat_service/` files (`bot_daily.py`, `bot_ws.py`, `streaming_tts.py`,
-  `megakernel_tts_service.py`, `index.html`), plus `requirements_frozen.txt` + `scripts/setup_box.sh`.
-- Model weights download on first run via `HF_HOME=/workspace/hf` + `HF_TOKEN`.
+## 1. Bootstrap `/workspace` (copy-paste, in order)
+
+Every runnable script does `sys.path.insert(0, "/workspace")` and imports `megakernel_tts_service`
+/ `streaming_tts` as **top-level** modules, and uses `PYTHONPATH=/workspace/qwen_megakernel`. So the
+`/workspace` layout below must exist before anything runs. Run these from a clone of THIS repo:
+
+```bash
+cd /workspace
+
+# (a) the two load-bearing external repos (pinned to the commits this was built against)
+git clone https://github.com/AlpinDale/qwen_megakernel /workspace/qwen_megakernel
+git -C /workspace/qwen_megakernel checkout 5030e15
+git clone https://github.com/QwenLM/Qwen3-TTS /workspace/Qwen3-TTS
+git -C /workspace/Qwen3-TTS checkout 022e286
+
+# (b) flatten THIS repo's service + bench + script files into /workspace so the imports resolve
+cp /path/to/this-repo/pipecat_service/*.py /workspace/
+cp /path/to/this-repo/pipecat_service/index.html /workspace/
+cp /path/to/this-repo/bench/*.py /workspace/bench/ 2>/dev/null; mkdir -p /workspace/bench && cp /path/to/this-repo/bench/*.py /workspace/bench/
+cp /path/to/this-repo/scripts/demo_e2e.py /workspace/
+cp /path/to/this-repo/requirements_frozen.txt /path/to/this-repo/scripts/setup_box.sh /workspace/
+
+# (c) reference voice clip for voice-clone (the demos' ref_text matches THIS clip)
+curl -L -o /workspace/ref.wav https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav
+#   ref_text = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it!"
+```
+
+- **Model weights** download on first run via `HF_HOME=/workspace/hf` + `HF_TOKEN` — model id
+  `Qwen/Qwen3-TTS-12Hz-0.6B-Base` (Apache-2.0, ungated; a HF token still avoids rate limits).
 
 ## 2. Build the environment
 ```
@@ -27,7 +52,9 @@ This makes a clean venv at **/opt/venv** (kept off `/workspace`, which can devel
 installs torch 2.9.1+cu130 + all pinned deps + editable `qwen_tts`, and verifies imports.
 
 ## 3. Keys
-Write **/opt/cfg/.env** (kept off the corruptible workspace path):
+Write **/opt/cfg/.env** — this is the ONE path every script reads (`bot_daily.py`, `bot_ws.py`,
+`demo_e2e.py`, `stage_benchmark.py` all `load_dotenv("/opt/cfg/.env")`). Kept off `/workspace`
+(corruptible inodes) and out of the repo (never committed):
 ```
 DEEPGRAM_API_KEY=...
 GROQ_API_KEY=...
@@ -35,12 +62,15 @@ DAILY_API_KEY=...
 HF_TOKEN=...
 ```
 
-## 4. Run
+## 4. Run (from `/workspace`, where the flat imports resolve)
 ```
+cd /workspace
 export HF_HOME=/workspace/hf HF_TOKEN=... PYTHONPATH=/workspace/qwen_megakernel
 /opt/venv/bin/python bot_daily.py      # cloud Daily room (open the printed ROOM_URL)
 # or the local, no-cloud WebSocket UI:
 /opt/venv/bin/python bot_ws.py         # then: ssh -p <port> root@<box> -L 8000:localhost:8000 ; open http://localhost:8000
+# or server-side, no browser (writes demo_conversation.wav):
+/opt/venv/bin/python demo_e2e.py
 ```
 First run JIT-compiles the megakernel (1-3 min) + warms the vocoder.
 

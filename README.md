@@ -4,6 +4,8 @@ Run AlpinDale's [`qwen_megakernel`](https://github.com/AlpinDale/qwen_megakernel
 
 > **Status.** End-to-end working on an RTX 5090: the megakernel drives the Qwen3-TTS talker (hidden states match the reference at **0.9999** cosine), audio is streamed **frame-by-frame** into a Pipecat pipeline (Deepgram STT → Groq LLM → our megakernel TTS → audio over WebRTC), and a live browser↔GPU voice demo runs end-to-end. Benchmarks measured; honest analysis below.
 
+> **▶ Demo recording:** [`recording/demo_voice_agent.mov`](recording/demo_voice_agent.mov) — live browser ↔ RTX 5090 voice loop, end-to-end.  ·  **Demo walkthrough / how-to-run the demo:** [`DEMO.md`](DEMO.md)  ·  **Reproducible setup:** [`SETUP.md`](SETUP.md)  ·  **Performance numbers + methodology:** [`bench/results.md`](bench/results.md)
+
 ## What it does
 
 Modern neural TTS is an autoregressive transformer (a "talker") that predicts discrete audio *codec tokens*, plus a codec decoder that turns those tokens into a waveform. Qwen3-TTS's talker is a Qwen3 transformer — the *same architecture* the megakernel already accelerates — so we swap the talker's decode trunk onto the megakernel and keep the rest of the pipeline in PyTorch.
@@ -66,29 +68,33 @@ recording/        demo_voice_agent.mov (end-to-end voice-agent demo)
 
 ## Build / run
 
-Fresh-box setup (env + deps) is in **[`SETUP.md`](SETUP.md)** via `scripts/setup_box.sh` (clean venv, torch, all pinned deps, editable `qwen_tts`, verify). Then:
+Full reproducible setup (rent box → clone deps → flatten files into `/workspace` → build env → keys)
+is in **[`SETUP.md`](SETUP.md)** — follow it once, then everything runs **from `/workspace`** (the
+scripts import `megakernel_tts_service` / `streaming_tts` flat off `/workspace`). The commands below
+assume that `/workspace` bootstrap is done:
 
 ```bash
-# RTX 5090 box (CUDA 13.0 -devel image; also runs on CUDA 12.9 / torch 2.9.1+cu128 — see SETUP.md).
-# Weights download on first run via HF_HOME + HF_TOKEN.
+# RTX 5090 box (CUDA 13.0 -devel image, driver >=570; also runs on CUDA 12.9 / torch 2.9.1+cu128).
+# Weights download on first run via HF_HOME + HF_TOKEN (model: Qwen/Qwen3-TTS-12Hz-0.6B-Base).
+cd /workspace
 export HF_HOME=/workspace/hf PYTHONPATH=/workspace/qwen_megakernel
+PY=/opt/venv/bin/python
 
 # 1. Validation + kernel-driven synthesis
-PYTHONPATH=$PYTHONPATH python talker/validate_talker_trunk.py   # 0.9999 hidden-state match
-PYTHONPATH=$PYTHONPATH python talker/megakernel_talker.py       # kernel-driven audio
+$PY talker/validate_talker_trunk.py   # 0.9999 hidden-state match vs reference
+$PY talker/megakernel_talker.py       # kernel-driven audio
 
 # 2. Benchmarks
-python -m qwen_megakernel.bench                                  # isolated megakernel tok/s
-PYTHONPATH=$PYTHONPATH python bench/kernel_step_bench.py         # trunk per-step
-PYTHONPATH=$PYTHONPATH python bench/stage_benchmark.py           # per-stage breakdown + end-to-end RTF (§3-4)
+$PY -m qwen_megakernel.bench          # isolated megakernel tok/s (from the upstream kernel repo)
+$PY bench/kernel_step_bench.py        # kernel-as-trunk per-step
+$PY bench/stage_benchmark.py          # per-stage breakdown + end-to-end RTF (§3-4)
 
-# 3. Live Pipecat voice demo (needs DEEPGRAM_API_KEY, GROQ_API_KEY, DAILY_API_KEY in /opt/cfg/.env)
-PYTHONPATH=$PYTHONPATH python pipecat_service/bot_daily.py       # prints a Daily ROOM_URL to open in a browser
-# or, no cloud (browser <-> GPU over an ssh -L tunnel):
-PYTHONPATH=$PYTHONPATH python pipecat_service/bot_ws.py          # open http://localhost:8000 via ssh -L 8000:localhost:8000
+# 3. Live Pipecat voice demo (keys in /opt/cfg/.env)
+$PY bot_daily.py                      # prints a Daily ROOM_URL to open in a browser
+$PY bot_ws.py                         # or no-cloud: open http://localhost:8000 via ssh -L 8000:localhost:8000
 
-# 4. Server-side end-to-end (no browser): real speech -> STT -> LLM -> kernel TTS -> demo_conversation.wav
-PYTHONPATH=$PYTHONPATH python scripts/demo_e2e.py
+# 4. Server-side end-to-end (no browser) -> demo_conversation.wav
+$PY demo_e2e.py
 ```
 
 ## Credits

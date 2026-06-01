@@ -1,13 +1,17 @@
 # Demo
 
+**▶ Recording:** [`recording/demo_voice_agent.mov`](recording/demo_voice_agent.mov) — the live
+browser ↔ RTX 5090 voice loop (user speaks → Deepgram STT → Groq LLM → megakernel Qwen3-TTS →
+streamed audio back), end-to-end.
+
 ## Live voice demo (Daily, NAT-proof)
 
-`python pipecat_service/bot_daily.py` on an RTX 5090 box with `.env` holding `DEEPGRAM_API_KEY`,
-`GROQ_API_KEY`, `DAILY_API_KEY`. It creates a Daily room and prints `ROOM_URL`; open that URL in a
-browser, allow the mic, and talk. Pipeline: Daily mic -> **Deepgram STT** -> **Groq LLM** ->
-**megakernel Qwen3-TTS (streaming)** -> Daily audio. Use **headphones** (avoids the bot hearing
-itself). Daily is used because WebRTC media is UDP peer-to-peer and a headless GPU behind NAT
-cannot do direct media without a relay (the SmallWebRTC-over-SSH-tunnel path fails ICE).
+Run `bot_daily.py` from `/workspace` (keys in `/opt/cfg/.env`: `DEEPGRAM_API_KEY`, `GROQ_API_KEY`,
+`DAILY_API_KEY`). It creates a Daily room and prints `ROOM_URL`; open that URL in a browser, allow
+the mic, and talk. Pipeline: Daily mic -> **Deepgram STT** (`nova-2`) -> **Groq LLM**
+(`llama-3.3-70b-versatile`) -> **megakernel Qwen3-TTS (streaming)** -> Daily audio. Use **headphones**
+(avoids the bot hearing itself). Daily is used because WebRTC media is UDP peer-to-peer and a headless
+GPU behind NAT cannot do direct media without a relay (the SmallWebRTC-over-SSH-tunnel path fails ICE).
 
 ## Server-side demo (no browser)
 
