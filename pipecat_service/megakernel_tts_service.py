@@ -16,10 +16,18 @@ Offline self-test (no browser):  PYTHONPATH=/path/to/qwen_megakernel python mega
 """
 import os, asyncio, types, time, numpy as np, torch, soundfile as sf
 from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers import DynamicCache
 from pipecat.services.tts_service import TTSService
 from pipecat.frames.frames import TTSAudioRawFrame
 from qwen_tts import Qwen3TTSModel
 from qwen_megakernel.model import Decoder
+
+
+def _cache_kv(cache, i):
+    # DynamicCache layout differs across transformers versions; support both.
+    if hasattr(cache, "layers"):
+        return cache.layers[i].keys, cache.layers[i].values
+    return cache.key_cache[i], cache.value_cache[i]
 
 HID, HEADDIM, MAXSEQ, VOCAB, NKV, NL = 1024, 128, 2048, 151936, 8, 28
 SR = 24000
@@ -43,24 +51,44 @@ def build_kernel_tts(model_path="Qwen/Qwen3-TTS-12Hz-0.6B-Base"):
     dec = Decoder(weights=dict(embed_weight=embed,layer_weights=lw,
             final_norm_weight=sd["norm.weight"].to(torch.bfloat16).cuda().contiguous(),
             lm_head_weight=dummy,cos_table=cos_t,sin_table=sin_t), tokenizer=None, verbose=False)
+    _orig_trunk_fwd = trunk.forward                              # reference batched forward (pre-patch)
+    _batch_prefill = os.environ.get("MEGAKERNEL_BATCH_PREFILL", "1") == "1"
     def kf(self, *a, **kw):
         ie, pkv, cp = kw.get("inputs_embeds"), kw.get("past_key_values"), kw.get("cache_position")
         uc = kw.get("use_cache", True); q = ie.shape[1]
         start = int(cp[0]) if cp is not None else (pkv.get_seq_length() if pkv is not None else 0)
         if start == 0: dec.reset()
-        ieb = ie[0].to(torch.bfloat16); hid = torch.empty(q,HID,dtype=torch.bfloat16,device="cuda")
-        # L1: prefill skips the discarded full-vocab lm_head per token (step_prefill) — same body kernel,
-        # so _norm_out + KV are byte-identical (0.9999 preserved), but ~107ms of wasted lm_head removed.
-        # Falls back to step(0) if the no-head kernel op isn't present (older build).
-        _pf = getattr(dec, "step_prefill", None) if q > 1 else None
-        if _pf is not None:
-            for j in range(q): embed[0].copy_(ieb[j]); _pf(); hid[j]=dec._norm_out.to(torch.bfloat16)
+        # B2: BATCHED PREFILL. The talker prefill was 110 sequential single-token megakernel steps
+        # (~0.8ms each ≈ 87ms, the dominant TTFC term). The kernel stores post-qk-norm/post-RoPE K and
+        # raw V — IDENTICAL to HF's DynamicCache — so we instead run the reference trunk forward ONCE
+        # over the whole context and bridge its per-layer K/V into the kernel's cache, then let the
+        # kernel do the (single-token) DECODE steps as before. Validated: the decode hidden after the
+        # bridge matches the full reference at 0.9999 (better than the per-token path, which accumulates
+        # the kernel's per-layer ~1e-4 across 28 layers). Decode (q==1) still runs on the megakernel.
+        if _batch_prefill and q > 1 and start == 0:
+            tmp = DynamicCache()
+            kw2 = dict(kw); kw2["past_key_values"] = tmp; kw2["use_cache"] = True
+            out = _orig_trunk_fwd(**kw2)
+            for i in range(NL):
+                kk, vv = _cache_kv(tmp, i)
+                dec._k_cache[i, :, start:start + q, :] = kk[0].to(torch.bfloat16)
+                dec._v_cache[i, :, start:start + q, :] = vv[0].to(torch.bfloat16)
+            dec._position = start + q
+            last = out.last_hidden_state
         else:
-            for j in range(q): embed[0].copy_(ieb[j]); dec.step(0); hid[j]=dec._norm_out.to(torch.bfloat16)
+            ieb = ie[0].to(torch.bfloat16); hid = torch.empty(q,HID,dtype=torch.bfloat16,device="cuda")
+            # L1: prefill skips the discarded full-vocab lm_head per token (step_prefill) — same body
+            # kernel, so _norm_out + KV are byte-identical (0.9999 preserved), but ~107ms of wasted
+            # lm_head removed. Falls back to step(0) if the no-head kernel op isn't present.
+            _pf = getattr(dec, "step_prefill", None) if q > 1 else None
+            if _pf is not None:
+                for j in range(q): embed[0].copy_(ieb[j]); _pf(); hid[j]=dec._norm_out.to(torch.bfloat16)
+            else:
+                for j in range(q): embed[0].copy_(ieb[j]); dec.step(0); hid[j]=dec._norm_out.to(torch.bfloat16)
+            last = hid.unsqueeze(0)
         if uc and pkv is not None:
             z = torch.zeros(1,NKV,q,HEADDIM,dtype=torch.bfloat16,device="cuda")
             for li in range(NL): pkv.update(z,z,li,{})
-        last = hid.unsqueeze(0)
         return BaseModelOutputWithPast(last_hidden_state=last, past_key_values=pkv, hidden_states=(last,))
     trunk.forward = types.MethodType(kf, trunk)
     # Optimization (measured on RTX 5090, bf16, batch 1): the 5-layer code-predictor runs 15
