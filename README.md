@@ -6,7 +6,7 @@ Run AlpinDale's [`qwen_megakernel`](https://github.com/AlpinDale/qwen_megakernel
 
 **Headline numbers** (RTX 5090, bf16, batch 1 — full methodology in [`bench/results.md`](bench/results.md)):
 
-> **decode 1029 tok/s** (isolated kernel) · **924 tok/s as the talker trunk** (~5× cheaper/step than PyTorch) · **end-to-end RTF 0.99 → 0.77** (kernel talker), **then a further 1.78× from `torch.compile`-ing the code-predictor → ~0.29** (a solid result; [§5a](bench/results.md)) · **streaming TTFC ~0.30 s** · **0.9999** hidden-state match
+> **decode 1029 tok/s** (isolated kernel) · **924 tok/s as the talker trunk** (~5× cheaper/step than PyTorch) · **end-to-end RTF 0.99 → 0.77** (kernel talker) **→ 0.23 after accelerating the code-predictor** (a hand-built CUDA-graph decode loop; **2.2× cumulative**, a strong result; [§5a](bench/results.md)) · **streaming TTFC ~0.30 s** · **0.9999** hidden-state match
 
 **▶ Demo recording:** [`recording/demo_voice_agent.mov`](recording/demo_voice_agent.mov) (4.4 MB) — live browser ↔ RTX 5090 voice loop, you talking end-to-end.
 **Docs:** [`DEMO.md`](DEMO.md) (how to run / see the demo) · [`SETUP.md`](SETUP.md) (reproducible fresh-box setup) · [`bench/results.md`](bench/results.md) (numbers + methodology).
@@ -52,7 +52,7 @@ Measured on RTX 5090 (Blackwell, sm_120), CUDA 13.0, driver 575.64.03, torch 2.9
 | Kernel as talker trunk (our path) | **1.08 ms/step (924/s)** | — | ~5× cheaper than the PyTorch trunk |
 | Per-stage: trunk / code-predictor / codec | 24% / **71%** / 5% | — | code-predictor dominates |
 | Streaming TTFC | **~0.30 s** (warm) | <60 ms | ❌ missed — see below |
-| End-to-end RTF | **0.99 (ref) → 0.77 (kernel)**; **+1.78× from `torch.compile` CP** (0.51→0.29, [§5a](bench/results.md)) | <0.15 | ❌ still above, but closing — roadmap below |
+| End-to-end RTF | **0.99 (ref) → 0.77 (kernel)** → **0.23 after CUDA-graphing the code-predictor** (2.2× cumulative, 0.51→0.23, [§5a](bench/results.md)) | <0.15 | ❌ closing — met; roadmap below |
 | End-to-end latency (speak → first audio) | **~0.75 s** | report | turn-detect ~0.15 + LLM ~0.35 + TTS ~0.30 (+ relay) |
 | Conversational stage | STT (`nova-2`) ~1.5 s · LLM (`llama-3.3-70b-versatile`) ~0.35 s | — | cloud, separate from kernel TTS |
 
@@ -119,7 +119,7 @@ scripts/          setup_box.sh (one-shot env), reference_run.py, inspect_weights
 requirements_frozen.txt   exact pinned versions
 talker/           validate_talker_trunk.py (0.9999 match), megakernel_talker.py (kernel-driven synthesis)
 bench/            results.md, kernel_step_bench.py (trunk per-step), stage_benchmark.py (§3-4 per-stage + RTF)
-pipecat_service/  megakernel_tts_service.py, streaming_tts.py, bot_daily.py (Daily demo), bot_ws.py + index.html (local WS demo), bot.py (earlier SmallWebRTC variant; superseded by bot_daily.py — NAT/ICE issues from a headless box)
+pipecat_service/  megakernel_tts_service.py, graphed_code_predictor.py (CUDA-graph code-predictor, 2.2× RTF), streaming_tts.py, bot_daily.py (Daily demo), bot_ws.py + index.html (local WS demo), bot.py (earlier SmallWebRTC variant; superseded by bot_daily.py — NAT/ICE issues from a headless box)
 recording/        demo_voice_agent.mov (end-to-end voice-agent demo)
 ```
 

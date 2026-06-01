@@ -59,31 +59,34 @@ reproduce on your hardware (it prints per-run RTF for the reference and kernel p
   hidden 1024, head_dim 128, 16/8 heads, θ=1e6). Driving it on the same megakernel, or batching/CUDA-graphing
   its 15 per-frame depth-steps, attacks the real 71%. This is the highest-leverage next step.
 
-## 5a. Optimization APPLIED — `torch.compile` the code-predictor (measured win)
+## 5a. Optimization APPLIED — accelerate the code-predictor (measured, 2.2× end-to-end)
 
 We acted on the analysis above. The code-predictor runs `code_predictor.generate(max_new_tokens=15)` — 15
 sequential HF decode steps per 12.5 Hz frame, each at seqlen-1 / batch-1 → ~700 tiny kernel launches/frame,
-**launch-bound, not compute-bound**. We `torch.compile` `code_predictor.model` (one line in `build_kernel_tts`).
-Measured on an RTX 5090 (3 runs each, same prompt):
+**dispatch-bound, not compute-bound** (an isolated step is **5.06×** faster under a CUDA graph — proof it's
+launch overhead). Two shippable accelerations, measured on an RTX 5090 (3 runs each, same prompt; audio healthy):
 
-| Config | code-predictor | share of total | end-to-end RTF | cumulative |
+| Config | code-predictor | share | end-to-end RTF | cumulative |
 |---|---|---|---|---|
 | Before (eager) | **35.1 ms/frame** | 85% | **0.513** | — |
 | `torch.compile` (default) | 18.8 ms/frame | 75% | 0.314 | 1.63× |
-| **`torch.compile` `max-autotune-no-cudagraphs`** (shipped) | **17.1 ms/frame** | 73% | **0.288** | **1.78×** |
+| `torch.compile` `max-autotune-no-cudagraphs` | 17.1 ms/frame | 73% | 0.288 | 1.78× |
+| **hand-captured CUDA graph** (default, `MEGAKERNEL_GRAPH_CP=1`) | **12.5 ms/frame** | 68% | **0.230** | **2.23×** |
 
-Numerically faithful: max abs waveform diff vs eager ≈ **1e-4**; audio rms unchanged (~0.07). RTF **0.513 → 0.288**
-is a **1.78× end-to-end speedup**, and ~0.288 matches the **our measured RTF**. Enabled by
-default; `MEGAKERNEL_COMPILE_CP=0` disables it.
+RTF **0.513 → 0.230** end-to-end, audio rms unchanged (~0.07–0.09 = healthy speech). 0.288 already matches the
+**our measured RTF**; the CUDA-graph build beats it.
 
-**Why not CUDA graphs** (`mode="reduce-overhead"`, the bigger theoretical win): tried, and it fails on this
-model. With a dynamic cache it `AssertionError`s in cudagraph-trees; forcing `cache_implementation="static"`
-gets graphs to capture but then the per-frame 15-step loop hits *"accessing tensor output of CUDAGraphs that
-has been overwritten by a subsequent run"* — the code-predictor's static-KV `.generate()` does an in-place
-`index_copy_` into the KV tensors every depth-step, which cudagraph-trees can't manage across the loop even
-with `cudagraph_mark_step_begin()`. Cracking that needs a **hand-written static-cache decode loop** (replace HF
-`.generate()`) or the **full megakernel-fuse of the 5-layer stack** — the noted next levers (~2.5–3× then
-more). `max-autotune` is the safe, shipped win that banks most of the fusion benefit without that fragility.
+**Making CUDA graphs hold — the lever HF generate can't get itself.** `mode="reduce-overhead"` fails on this
+model: a dynamic cache `AssertionError`s in cudagraph-trees, and forcing `cache_implementation="static"` then
+hits *"tensor output of CUDAGraphs overwritten by a subsequent run"* (the static-KV `.generate()` does an
+in-place `index_copy_` into the KV every depth-step, which cudagraph-trees can't manage across the loop, even
+with `cudagraph_mark_step_begin()`). We sidestep it in `pipecat_service/graphed_code_predictor.py`: a hand-built
+decode loop over a `StaticCache` + static input/position/cache buffers, the 5-layer `model.forward` captured
+**once** as a `torch.cuda.CUDAGraph` and replayed 15×/frame via `copy_()`/`fill_()`; lm_head + sampling stay
+eager. Correctness: the manual loop is **bit-exact vs stock `generate()` on a DynamicCache**; the StaticCache
+needed for graphs differs by ~ulp (flips greedy argmax only on near-ties — within the model's temperature-0.9
+sampling stochasticity). Default on; falls back to stock `generate` on any failure. **Next lever:** the full
+megakernel-fuse of the 5-layer stack (toward the documented ~0.15–0.18 floor).
 
 ## 6. Streaming, TTFC, and the brief's targets — stated honestly
 

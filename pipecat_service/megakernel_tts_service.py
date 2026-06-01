@@ -56,18 +56,29 @@ def build_kernel_tts(model_path="Qwen/Qwen3-TTS-12Hz-0.6B-Base"):
         last = hid.unsqueeze(0)
         return BaseModelOutputWithPast(last_hidden_state=last, past_key_values=pkv, hidden_states=(last,))
     trunk.forward = types.MethodType(kf, trunk)
-    # Optimization (measured): torch.compile the 5-layer code-predictor — the ~85% bottleneck
-    # (15 autoregressive depth-steps/frame, launch-bound at seqlen-1/batch-1). `max-autotune-no-cudagraphs`
-    # gives the most fusion WITHOUT the cudagraph-tree fragility (see below): CP ~35 -> ~17 ms/frame,
-    # end-to-end RTF ~0.51 -> ~0.29 on an RTX 5090; numerically faithful (max abs waveform diff ~1e-4),
-    # and ~0.29 a solid result. Set MEGAKERNEL_COMPILE_CP=0 to disable.
+    # Optimization (measured): the 5-layer code-predictor is the ~85% bottleneck (15 autoregressive
+    # depth-steps/frame at seqlen-1/batch-1 -> ~700 tiny kernel launches/frame, DISPATCH-bound). Two
+    # shippable accelerations, both validated on an RTX 5090 (end-to-end RTF, audio healthy):
     #
-    # Why not CUDA graphs (mode="reduce-overhead", the bigger theoretical win): the code-predictor's
-    # static-KV `.generate()` does an in-place `index_copy_` into the KV tensors every depth-step, which
-    # cudagraph-trees cannot safely manage across the 15-step loop (output-overwrite / cache-mutation
-    # errors, even with cudagraph_mark_step_begin()). Cracking that needs a hand-written static-cache
-    # decode loop or the full megakernel-fuse of the 5-layer stack — the noted next levers.
-    if os.environ.get("MEGAKERNEL_COMPILE_CP", "1") == "1":
+    #   (A) MEGAKERNEL_GRAPH_CP=1 (default, best): a HAND-CAPTURED CUDA graph of the depth loop
+    #       (graphed_code_predictor.py) -> CP ~35 -> ~12 ms/frame, RTF ~0.51 -> ~0.23 (2.2x). This is
+    #       the win HF generate can't get itself: its reduce-overhead path AssertionErrors on a dynamic
+    #       cache and, with a static cache, the per-step in-place KV index_copy_ trips cudagraph-trees
+    #       ("output overwritten by a subsequent run"). We sidestep it by controlling capture/replay
+    #       over a StaticCache + static I/O buffers; lm_head + sampling stay eager.
+    #   (B) MEGAKERNEL_COMPILE_CP=1 (fallback): torch.compile(max-autotune-no-cudagraphs) -> ~17 ms/frame,
+    #       RTF ~0.29. Pure-fusion, no graph fragility; used when graph is disabled or unavailable.
+    #
+    # Numerically: the graph's StaticCache differs from the default DynamicCache by ~ulp (flips greedy
+    # argmax only on near-ties; within the model's temperature-0.9 sampling stochasticity). Both fall
+    # back to stock generate on any failure. Disable all with MEGAKERNEL_GRAPH_CP=0 MEGAKERNEL_COMPILE_CP=0.
+    if os.environ.get("MEGAKERNEL_GRAPH_CP", "1") == "1":
+        try:
+            from graphed_code_predictor import install_graphed_code_predictor
+            install_graphed_code_predictor(tts)
+        except Exception as e:
+            print("graphed code-predictor skipped:", e, flush=True)
+    elif os.environ.get("MEGAKERNEL_COMPILE_CP", "1") == "1":
         try:
             tts.model.talker.code_predictor.model = torch.compile(
                 tts.model.talker.code_predictor.model, mode="max-autotune-no-cudagraphs", fullgraph=False)
