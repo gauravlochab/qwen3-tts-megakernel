@@ -71,7 +71,15 @@ launch overhead). Two shippable accelerations, measured on an RTX 5090 (3 runs e
 | Before (eager) | **35.1 ms/frame** | 85% | **0.513** | — |
 | `torch.compile` (default) | 18.8 ms/frame | 75% | 0.314 | 1.63× |
 | `torch.compile` `max-autotune-no-cudagraphs` | 17.1 ms/frame | 73% | 0.288 | 1.78× |
-| **hand-captured CUDA graph** (default, `MEGAKERNEL_GRAPH_CP=1`) | **12.5 ms/frame** | 68% | **0.230** | **2.23×** |
+| hand-captured CUDA graph, v1 (model fwd only) | 12.5 ms/frame | 68% | 0.230 | 2.23× |
+| **whole-frame CUDA graph, v2** (default, `MEGAKERNEL_GRAPH_CP=1`) | **~11 ms/frame** | 65% | **0.208** | **2.47×** |
+
+v2 (`graphed_code_predictor_v2.py`) folds the *entire* per-frame work — 2-token prefill + 15 decode
+forwards + 15 `lm_head` matmuls + top-k/softmax/multinomial sampling + next-token embed — into ONE
+captured graph (per frame: only `cache.reset()` + an input `copy_()` + `graph.replay()`). RTF **0.230 → 0.208**,
+audio healthy (rms 0.033), independently re-measured via `baseline_bench.py` (3 runs: 0.208/0.208/0.212).
+`multinomial` is graph-capturable and its philox RNG counter advances across replays, so sampling stays
+correct under capture.
 
 RTF **0.513 → 0.230** end-to-end, audio rms unchanged (~0.07–0.09 = healthy speech). 0.288 already matches the
 **our measured RTF**; the CUDA-graph build beats it.
