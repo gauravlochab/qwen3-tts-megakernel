@@ -27,7 +27,7 @@ from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnal
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.transports.daily.transport import DailyTransport, DailyParams
 from pipecat.frames.frames import TTSSpeakFrame
-from megakernel_tts_service import build_kernel_tts
+from megakernel_tts_service import build_kernel_tts, prewarm_kernel_tts
 from streaming_tts import MegakernelStreamingTTS
 
 SYSTEM = ("You are a friendly voice assistant whose speech is synthesized by a CUDA megakernel "
@@ -49,21 +49,10 @@ async def main():
     print(f"\nROOM_URL: {room}\n", flush=True)
     print("loading kernel-backed TTS model (once)...", flush=True)
     tts_model = build_kernel_tts()
-    try:  # Warm with the EXACT sampling params the live service uses, so the code-predictor's CUDA
-        # graph captures under the real configuration NOW (at startup) instead of recapturing on the
-        # first user turn. This is the TTFC fix: the graph capture is a ~1.1s one-time cost — paying it
-        # here drops the FIRST real reply's TTFC from ~220ms (recapture) to ~67ms warm (≈ the <60ms band).
-        # Two passes: the graph captures on pass 1, pass 2 confirms it's warm. Same params as the TTS service.
-        for _ in range(2):
-            tts_model.generate_voice_clone(
-                text="Warming up the megakernel and the code-predictor CUDA graph now.",
-                language="Auto", ref_audio="/workspace/ref.wav", ref_text=REF_TEXT_CLONE,
-                x_vector_only_mode=False, max_new_tokens=64, do_sample=True, top_k=50, top_p=1.0,
-                temperature=0.9, repetition_penalty=1.05, subtalker_dosample=True, subtalker_top_k=50,
-                subtalker_top_p=1.0, subtalker_temperature=0.9)
-        print("warmup done (graph pre-captured)", flush=True)
-    except Exception as e:
-        print("warmup skipped:", e, flush=True)
+    # Pre-capture the code-predictor CUDA graph + warm the vocoder/sampler at startup with the service's
+    # real sampling params, so the first user turn doesn't pay the one-time graph capture (~1.1s) or any
+    # cold-start. Warmup-only — does not touch model math (0.9999 unaffected).
+    prewarm_kernel_tts(tts_model, "/workspace/ref.wav", REF_TEXT_CLONE)
 
     transport = DailyTransport(room, None, "Megakernel TTS Bot",
                                DailyParams(audio_in_enabled=True, audio_out_enabled=True, audio_out_sample_rate=24000))

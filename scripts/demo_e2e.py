@@ -1,6 +1,6 @@
 """Server-side end-to-end demo (no browser): real speech in (ref.wav) -> Deepgram STT -> Groq LLM
 -> megakernel Qwen3-TTS reply -> stitched demo_conversation.wav. Proves the full pipeline without a
-WebRTC client. Official sampling + a max_new_tokens safety cap (base-model over-generation is a
+WebRTC client. Model's default sampling + a max_new_tokens safety cap (base-model over-generation is a
 documented trait, see DEMO.md)."""
 import os, sys, requests, numpy as np, soundfile as sf, torch, librosa
 sys.path.insert(0, "/workspace")

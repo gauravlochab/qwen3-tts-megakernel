@@ -3,7 +3,7 @@
 MegakernelQwen3TTSService subclasses pipecat.services.tts_service.TTSService and yields
 TTSAudioRawFrame chunks. The talker trunk runs on AlpinDale's qwen_megakernel (see
 talker/megakernel_talker.py); codec_head / code_predictor / 12 Hz codec run in PyTorch via the
-official qwen_tts pipeline. The blocking CUDA synthesis runs in a worker thread so it doesn't
+qwen_tts pipeline. The blocking CUDA synthesis runs in a worker thread so it doesn't
 stall Pipecat's asyncio loop.
 
 Offline-validated: run_tts produced 1022 TTSAudioRawFrames reconstructing valid audio.
@@ -101,6 +101,34 @@ def build_kernel_tts(model_path="Qwen/Qwen3-TTS-12Hz-0.6B-Base"):
         except Exception as e:
             print("code_predictor torch.compile skipped:", e, flush=True)
     return tts
+
+
+# Startup warmup (zero risk to 0.9999 — warmup/scheduling only). Captures the code-predictor CUDA graph
+# at boot with the SERVICE sampling params so it does NOT recapture on the first user turn (the lazy
+# capture is a one-time ~1.1s cost that would otherwise land on the first reply); warms the vocoder with
+# varied codes (a same-input warmup only primes the internal cache and is misleading); and warms the
+# sampler (multinomial/softmax/topk). Call once at startup BEFORE serving.
+def prewarm_kernel_tts(tts, ref_audio, ref_text, gen=None):
+    g = gen or dict(max_new_tokens=64, do_sample=True, top_k=50, top_p=1.0, temperature=0.9,
+                    repetition_penalty=1.05, subtalker_dosample=True, subtalker_top_k=50,
+                    subtalker_top_p=1.0, subtalker_temperature=0.9)
+    # 1) varied-code vocoder warmup (cold first-decode is ~10-20ms otherwise)
+    try:
+        for _ in range(5):
+            codes = torch.randint(0, 2048, (8, tts.model.talker.config.num_code_groups), device="cuda")
+            tts.model.speech_tokenizer.decode([{"audio_codes": codes}])
+    except Exception as e:
+        print("vocoder warmup skipped:", e, flush=True)
+    # 2) two full generations with the EXACT service params -> captures the CP CUDA graph at boot under
+    #    the real configuration (so turn 1 doesn't pay the ~1.1s recapture) + warms the sampler path.
+    try:
+        for _ in range(2):
+            tts.generate_voice_clone(text="Warming up the megakernel and the code-predictor CUDA graph now.",
+                                     language="Auto", ref_audio=ref_audio, ref_text=ref_text,
+                                     x_vector_only_mode=False, **g)
+        print("prewarm done (CP graph pre-captured, vocoder+sampler warm)", flush=True)
+    except Exception as e:
+        print("prewarm skipped:", e, flush=True)
 
 
 class MegakernelQwen3TTSService(TTSService):

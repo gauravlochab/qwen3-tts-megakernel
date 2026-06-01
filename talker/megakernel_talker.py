@@ -1,7 +1,7 @@
 """End-to-end KERNEL-DRIVEN audio synthesis.
 
 Monkeypatches the Qwen3-TTS talker trunk (tts.model.talker.model) so its forward runs on
-AlpinDale's qwen_megakernel, then lets the official generate_voice_clone drive everything
+AlpinDale's qwen_megakernel, then lets the model's own generate_voice_clone drive everything
 else (codec_head, sampling, the 5-layer code_predictor, the 12 Hz codec) unchanged.
 
 How the kernel serves as the trunk:

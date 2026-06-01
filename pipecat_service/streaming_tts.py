@@ -33,7 +33,7 @@ class MegakernelStreamingTTS(TTSService):
         self._talker = tts.model.talker
         self._eos = int(getattr(self._talker.config, "codec_eos_token_id", -1))
         self._ref_audio, self._ref_text = ref_audio, ref_text
-        # The model's INTENDED sampling (matches the official example) + a max_new_tokens safety cap.
+        # The model's intended sampling defaults + a max_new_tokens safety cap.
         # (Tightening rep_penalty/temperature was tried and HURT quality -- caused repetition collapse;
         # over-generation on some texts is a base-model trait, not fixable by degrading sampling.)
         self._gen = dict(max_new_tokens=200, do_sample=True, top_k=50, top_p=1.0, temperature=0.9,

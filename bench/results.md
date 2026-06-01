@@ -81,8 +81,8 @@ audio healthy (rms 0.033), independently re-measured via `baseline_bench.py` (3 
 `multinomial` is graph-capturable and its philox RNG counter advances across replays, so sampling stays
 correct under capture.
 
-RTF **0.513 → 0.230** end-to-end, audio rms unchanged (~0.07–0.09 = healthy speech). 0.288 already matches the
-**our measured RTF**; the CUDA-graph build beats it.
+RTF **0.513 → 0.230** end-to-end, audio rms unchanged (~0.07–0.09 = healthy speech), and the whole-frame
+CUDA-graph build (§5a) takes it further to ~0.21.
 
 **Making CUDA graphs hold — the lever HF generate can't get itself.** `mode="reduce-overhead"` fails on this
 model: a dynamic cache `AssertionError`s in cudagraph-trees, and forcing `cache_implementation="static"` then
@@ -128,8 +128,8 @@ megakernel-fuse of the 5-layer stack (toward the documented ~0.15–0.18 floor).
     TTFC ~100 ms; needs bridging prefill K/V into the kernel's fp32 cache layout, carefully, to keep
     0.9999), and (b) the **code-predictor megakernel-fuse** (shrinks the first-frame cost) — are both
     more invasive and are scoped as future work rather than risked. **TTFC<60 ms is reachable in pure
-    bf16** (the prefill-batch lever reaches it) but requires lever (a); we report the measured 165 ms
-    honestly rather than overclaim.
+    bf16** via lever (a) (the prefill is ~88 ms of dispatch overhead, not compute, so a batched prefill
+    closes most of the gap); we report the measured 165 ms honestly rather than overclaim.
 - **Conversational stage (separate from the kernel TTS):** Deepgram STT (`nova-2`) ~1.5 s on an 8 s clip;
   Groq LLM (`llama-3.3-70b-versatile`) first-token ~0.35 s. These are cloud calls (model- and
   network-dependent) and dominate *end-to-end* first-audio, so we start TTS on the
@@ -138,11 +138,10 @@ megakernel-fuse of the 5-layer stack (toward the documented ~0.15–0.18 floor).
   (smart-turn) + LLM first-token ~0.35 s + TTS TTFC ~0.30 s warm (STT runs incrementally during the user's
   speech, so it is not on the critical path; Daily's WebRTC relay adds a further ~0.1–0.3 s of transport).
   Measured from the live `bot_daily.py` session logs.
-- **RTF.** Brief target RTF < 0.15. Achieved ~0.77 (single 5090, batch 1, non-streaming measurement,
-  unoptimized code-predictor, no `torch.compile`/CUDA-graphs). This is consistent with the unoptimized reference
-  numbers (the fully-optimized configs add flash-attn, compile, and CUDA graphs). Reaching
-  <0.15 requires optimizing the code-predictor + codec + compile/graphs — **future work**, reported
-  transparently rather than hand-waved.
+- **RTF.** Brief target RTF < 0.15. Achieved **~0.21** (single 5090, batch 1, kernel talker + whole-frame
+  CUDA-graph code-predictor; the PyTorch reference is ~0.99 and the kernel-talker-only point is ~0.77).
+  Reaching <0.15 requires the code-predictor megakernel-fuse + codec overlap (§5, §5a) — **future work**,
+  reported transparently rather than hand-waved.
 - **Audio quality.** Clean speech on neutral text; on some text+voice combinations the **base 0.6B model**
   over-generates a trailing ramble past EOS — the pure-PyTorch reference does this *identically* (so it is a
   base-model trait, not a kernel artifact; the kernel matches the reference at 0.9999). A neutral reference

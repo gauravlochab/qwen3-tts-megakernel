@@ -40,7 +40,7 @@ from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 from pipecat.serializers.protobuf import ProtobufFrameSerializer
 from pipecat.frames.frames import TTSSpeakFrame
-from megakernel_tts_service import build_kernel_tts, MegakernelQwen3TTSService
+from megakernel_tts_service import build_kernel_tts, MegakernelQwen3TTSService, prewarm_kernel_tts
 
 SYSTEM = ("You are a friendly voice assistant whose speech is synthesized by a CUDA megakernel "
           "running Qwen3-TTS. Reply in ONE very short spoken sentence — at most 12 words. Be direct.")
@@ -56,18 +56,9 @@ async def lifespan(app: FastAPI):
     global _TTS_MODEL
     print("loading kernel-backed TTS model (once)...", flush=True)
     _TTS_MODEL = build_kernel_tts()
-    try:  # Warm with the service's real sampling params (2 passes) so the code-predictor CUDA graph
-        # captures at startup, not on the first user turn (drops first-reply TTFC ~220ms -> ~165ms warm).
-        for _ in range(2):
-            _TTS_MODEL.generate_voice_clone(
-                text="Warming up the megakernel and the code-predictor CUDA graph now.",
-                language="Auto", ref_audio="/workspace/ref.wav", ref_text=REF_TEXT_CLONE,
-                x_vector_only_mode=False, max_new_tokens=64, do_sample=True, top_k=50, top_p=1.0,
-                temperature=0.9, repetition_penalty=1.05, subtalker_dosample=True, subtalker_top_k=50,
-                subtalker_top_p=1.0, subtalker_temperature=0.9)
-        print("warmup done (graph pre-captured)", flush=True)
-    except Exception as e:
-        print("warmup skipped:", e, flush=True)
+    # Pre-capture the code-predictor CUDA graph + warm the vocoder/sampler at startup (warmup-only;
+    # 0.9999 unaffected) so the first user turn doesn't pay the one-time graph capture or any cold-start.
+    prewarm_kernel_tts(_TTS_MODEL, "/workspace/ref.wav", REF_TEXT_CLONE)
     print("BOT READY — open http://localhost:8000 (via ssh -L 8000:localhost:8000) and talk.", flush=True)
     yield
 
