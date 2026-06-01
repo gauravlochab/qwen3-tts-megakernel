@@ -12,12 +12,16 @@ used by the live service (megakernel_tts_service.build_kernel_tts). The referenc
 Run:  PYTHONPATH=/workspace/qwen_megakernel python bench/stage_benchmark.py
 """
 import os, sys, time, numpy as np, torch
-sys.path.insert(0, "/workspace")
+# resolve the sibling pipecat_service dir so this reproduces from a plain repo clone (cwd-independent),
+# matching bench_cp_variants.py / correctness_cp.py
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "pipecat_service"))
+sys.path.insert(0, "/workspace")  # also honor the flattened /workspace layout if present
 from dotenv import load_dotenv
-load_dotenv("/opt/cfg/.env")
+load_dotenv(os.environ.get("ENV_FILE", "/opt/cfg/.env"))
 from qwen_tts import Qwen3TTSModel
 
-REF = "/workspace/ref.wav"
+REF = os.environ.get("REF_WAV", "/workspace/ref.wav")
 RT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it!"
 TEXT = "It sounds like you're feeling really hurt and conflicted about something I've done."
 GEN = dict(max_new_tokens=160, do_sample=True, top_k=50, top_p=1.0, temperature=0.9,

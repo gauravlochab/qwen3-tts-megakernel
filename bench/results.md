@@ -82,6 +82,13 @@ launch overhead). Successive accelerations, measured on an RTX 5090 (same prompt
 | whole-frame CUDA graph, v2 (HF module body) | ~10.8 ms/frame | 67% | 0.202 | 2.5× |
 | **hand-written GQA + Inductor-fused whole frame + CUDA graph, v3** (default) | **~3.0 ms/frame** | 35% | **~0.11** | **~9×** |
 
+*Reproduce + absolute-RTF note:* the committed `bench/bench_cp_variants.py` (median of 5, `max_new_tokens=160`)
+reproduces v1/v2/v3 end-to-end RTF ≈ **0.20 / 0.18 / 0.09** on a fresh clone — same ordering, and v3
+comfortably under 0.15. Absolute RTF is run/box/utterance-dependent: this §5a sweep starts from a shorter
+prompt (eager-CP RTF ~0.51), whereas the §3–4 "megakernel talker" baseline (~0.77) is measured on the
+longer §3 utterance with `stage_benchmark.py`; the two baselines are different utterances, not the same
+run. The headline to trust is the *relative* progression and **v3 < 0.15**, which both harnesses confirm.
+
 **v2** (`graphed_code_predictor_v2.py`) folds the *entire* per-frame work — 2-token prefill + 15 decode
 forwards + 15 `lm_head` matmuls + sampling + next-token embed — into ONE captured graph, but the body is
 still the HF Qwen3 module, so the graph records HF's full attention machinery (SDPA over a padded
@@ -134,9 +141,9 @@ fp32 KV — and, for v3, by compiling the frame before capture so the fused kern
     ~4 ms + codec.decode ~17 ms + code-predictor ~11 ms + lock-free handoff (~few ms, jitter-free).
   - **L1 (applied): skip the discarded full-vocab lm_head in prefill** ([`optimizations/`](../optimizations/)).
     Each prefill token was running a ~311 MB / 151936-row argmax matvec whose result is thrown away
-    (~0.97 ms/token × 110 ≈ 107 ms of waste, proven by `prove_lmhead.py`). A new `decode_no_head` kernel
+    (~0.97 ms/token × 110 ≈ 107 ms of waste, timed by isolating the lm_head launch). A new `decode_no_head` kernel
     path runs the identical body kernel without the lm_head → the hidden state is **bit-identical**
-    (`val_L1.py`: max abs diff 0.000, cosine **1.0000000**), so the 0.9999 invariant holds by construction.
+    (per-token A/B, `step` vs `step_prefill`: max abs diff 0.000, cosine **1.0000000**), so the 0.9999 invariant holds by construction.
     Prefill kernel work dropped ~107 → ~84 ms; the streaming prefill stage ~111 → ~88 ms; warm TTFC
     ~170 → ~162 ms.
   - **Warmup pre-capture (applied):** the code-predictor's CUDA graph (and, for v3, its one-time Inductor
@@ -168,10 +175,11 @@ fp32 KV — and, for v3, by compiling the frame before capture so the fused kern
   Groq LLM (`llama-3.3-70b-versatile`) first-token ~0.35 s. These are cloud calls (model- and
   network-dependent) and dominate *end-to-end* first-audio, so we start TTS on the
   reply text as soon as the LLM returns.
-- **End-to-end latency (speak-end → first audio chunk), live demo: ~0.75 s** = turn detection ~0.15 s
-  (smart-turn) + LLM first-token ~0.35 s + TTS TTFC ~0.30 s warm (STT runs incrementally during the user's
-  speech, so it is not on the critical path; Daily's WebRTC relay adds a further ~0.1–0.3 s of transport).
-  Measured from the live `bot_daily.py` session logs.
+- **End-to-end latency (speak-end → first audio chunk).** The critical-path budget is turn detection
+  ~0.15 s (smart-turn) + LLM first-token ~0.35 s + TTS TTFC ~0.058 s (STT runs incrementally during the
+  user's speech, so it is not on the critical path) + Daily's WebRTC relay ~0.1–0.3 s of transport — i.e.
+  ~0.55 s + relay, now LLM- and transport-bound rather than TTS-bound. (The earlier ~0.75 s figure from
+  live `bot_daily.py` logs predates the TTFC optimizations, when TTS TTFC was ~0.30 s.)
 - **RTF.** Brief target RTF < 0.15. **Achieved ~0.11** (single 5090, batch 1, kernel talker + hand-written
   GQA / Inductor-fused / CUDA-graphed code-predictor, v3). The PyTorch reference is ~0.99 and the
   kernel-talker-only point is ~0.77; accelerating the code-predictor (§5a) takes it 0.77 → 0.20 (v2) →

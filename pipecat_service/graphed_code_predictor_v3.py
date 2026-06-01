@@ -66,9 +66,6 @@ def install_graphed_code_predictor(tts):
     proj = cp.small_to_mtp_projection   # Identity on this checkpoint; applied for safety
 
     # ── gather the per-layer weights once (raw tensors, no module dispatch in the graph) ──────────
-    def _w(name):
-        return name.to(dt).contiguous()
-
     L = []
     for i in range(NL):
         sa = m.layers[i].self_attn
@@ -232,6 +229,9 @@ def install_graphed_code_predictor(tts):
         try:
             assert inputs_embeds is not None and inputs_embeds.shape[1] == 2, "expect 2-token context"
             assert max_new_tokens == NSTEP, f"capture is fixed at {NSTEP} steps"
+            # the graphed sampler implements temperature + top_k only; a caller requesting nucleus
+            # (top_p < 1.0) must NOT be silently downgraded -> raise so we fall back to stock generate.
+            assert top_p == 1.0, "graphed path supports top_p=1.0 only; top_p<1.0 -> stock fallback"
             ie = inputs_embeds.to(dt)
             if (state["graph"] is None or do_sample != state["do_sample"]
                     or temperature != state["temperature"] or top_k != state["top_k"]):

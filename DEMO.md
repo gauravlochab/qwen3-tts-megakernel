@@ -15,7 +15,8 @@ GPU behind NAT cannot do direct media without a relay (the SmallWebRTC-over-SSH-
 
 ## Server-side demo (no browser)
 
-`python scripts/demo_e2e.py` runs the full loop on a fixed input and writes `demo_conversation.wav`:
+`python demo_e2e.py` (run from `/workspace` after the SETUP flatten; it lives at `scripts/demo_e2e.py`
+in this repo) runs the full loop on a fixed input and writes `demo_conversation.wav`:
 real speech (`ref.wav`) -> Deepgram STT -> Groq LLM -> megakernel TTS reply, stitched into one clip.
 Example exchange:
 - **USER:** "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it. And thanks to you."
@@ -35,7 +36,8 @@ variant. Tightening sampling (repetition penalty / low temperature) was tried an
 
 True frame-by-frame streaming is implemented in `pipecat_service/streaming_tts.py`: audio chunks are
 emitted **as the talker decodes** (first chunk << total), satisfying "push chunks as decoded, do NOT
-buffer". **TTFC ≈ 0.30 s warm** (streaming self-test, the steady-state demo condition); the very first
-utterance after process start is higher (~2 s) due to one-time CUDA/codec cold-start. Both are far below
-the ~full-utterance latency of buffer-then-send. (Brief target is <60 ms — see `bench/results.md` §6 for
-the honest gap analysis.)
+buffer". **TTFC ≈ 58 ms warm median** (range 56–60 ms, streaming self-test) — **clears the brief's
+<60 ms target**. The very first utterance after process start is higher (~2 s) due to one-time
+CUDA/codec/compile cold-start; the bots pay this at boot via `prewarm_kernel_tts`. See
+[`bench/results.md`](bench/results.md) §6 for the full 162 → 80 → 58 ms progression (batched-prefill
+KV-bridge + a lock-free streaming handoff).

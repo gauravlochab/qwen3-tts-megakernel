@@ -17,7 +17,10 @@ faithfulness win). Tightening sampling (rep_penalty/low temp) was tried and HURT
 collapse), so the model's intended sampling is kept + a max_new_tokens cap bounds the worst case; a
 neutral reference voice (and the 1.7B variant) further reduce it.
 """
-import sys, time, queue, asyncio, numpy as np, torch, soundfile as sf
+import os, sys, time, queue, asyncio, numpy as np, torch, soundfile as sf
+# resolve the sibling module (megakernel_tts_service) from this file's dir so a clean clone imports
+# without depending on /workspace being on sys.path; also honor the flattened /workspace layout.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/workspace")
 from pipecat.services.tts_service import TTSService
 from pipecat.frames.frames import TTSAudioRawFrame

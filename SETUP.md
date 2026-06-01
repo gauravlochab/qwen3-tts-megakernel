@@ -29,10 +29,11 @@ git -C /workspace/qwen_megakernel checkout 5030e15
 git clone https://github.com/QwenLM/Qwen3-TTS /workspace/Qwen3-TTS
 git -C /workspace/Qwen3-TTS checkout 022e286
 
-# (b) flatten THIS repo's service + bench + script files into /workspace so the imports resolve
+# (b) flatten THIS repo's service + bench + talker + script files into /workspace so the imports resolve
 cp /path/to/this-repo/pipecat_service/*.py /workspace/
 cp /path/to/this-repo/pipecat_service/index.html /workspace/
-cp /path/to/this-repo/bench/*.py /workspace/bench/ 2>/dev/null; mkdir -p /workspace/bench && cp /path/to/this-repo/bench/*.py /workspace/bench/
+mkdir -p /workspace/bench && cp /path/to/this-repo/bench/*.py /workspace/bench/
+mkdir -p /workspace/talker && cp /path/to/this-repo/talker/*.py /workspace/talker/   # README step 1 runs talker/*.py from /workspace
 cp /path/to/this-repo/scripts/demo_e2e.py /workspace/
 cp /path/to/this-repo/requirements_frozen.txt /path/to/this-repo/scripts/setup_box.sh /workspace/
 

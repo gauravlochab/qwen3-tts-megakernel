@@ -113,6 +113,8 @@ def install_graphed_code_predictor(tts):
         try:
             assert inputs_embeds is not None and inputs_embeds.shape[1] == 2, "expect 2-token context"
             assert max_new_tokens == NSTEP, f"capture is fixed at {NSTEP} steps"
+            # graphed sampler is temperature + top_k only; don't silently drop nucleus -> fall back.
+            assert top_p == 1.0, "graphed path supports top_p=1.0 only; top_p<1.0 -> stock fallback"
             ie = inputs_embeds.to(dt)
             # (re)capture if sampling params changed or first call
             if (state["graph"] is None or do_sample != state["do_sample"]

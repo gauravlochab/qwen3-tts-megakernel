@@ -9,8 +9,8 @@ here as patches so they're reproducible; changes to *our* code (`pipecat_service
 **What & why.** During TTS prefill the megakernel decodes the ~110-token text prompt one token at a time.
 Each `step()` runs the body kernel (writing the post-RMSNorm hidden state `g_normalized`, which is all the
 TTS path consumes) **and then** `ldg_lm_head_fused` — a ~311 MB / 151936-row argmax matvec whose token is
-**thrown away** during prefill. Measured cost: ~0.97 ms/token × 110 ≈ **107 ms of pure waste** (see
-`bench/results.md` §6 and the `prove_lmhead.py` probe).
+**thrown away** during prefill. Measured cost: ~0.97 ms/token × 110 ≈ **107 ms of pure waste** (timed by
+isolating the `ldg_lm_head_fused` launch vs the body kernel; see `bench/results.md` §6).
 
 **The change.** Add `launch_ldg_decode_direct_nohead` (kernel.cu) + a `decode_no_head` torch op
 (torch_bindings.cpp) + `Decoder.step_prefill()` (model.py): identical body-kernel launch, **no** lm_head.
@@ -18,7 +18,7 @@ TTS path consumes) **and then** `ldg_lm_head_fused` — a ~311 MB / 151936-row a
 `step()` if the op isn't present, so it's safe on an unpatched build).
 
 **Correctness — bit-identical.** Because only a discarded computation is skipped, `g_normalized` and the
-KV cache are byte-for-byte the same. Validated (`val_L1.py`): per-token hidden state vs the full path =
+KV cache are byte-for-byte the same: a per-token A/B of the hidden state (`step` vs `step_prefill`) gives
 **max abs diff 0.000, cosine 1.0000000**. The 0.9999 invariant is preserved by construction. Audio
 healthy; decode-path RTF unchanged (~0.20).
 
