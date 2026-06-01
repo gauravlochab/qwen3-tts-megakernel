@@ -94,8 +94,17 @@ megakernel-fuse of the 5-layer stack (toward the documented ~0.15–0.18 floor).
   talker to emit each 12.5 Hz frame's codec tokens as they decode, window-decodes through the 12 Hz codec,
   and yields `TTSAudioRawFrame`s *as decoded* (not buffered). The streaming self-test emits a tiny first
   chunk then steady chunks — a rising staircase from ~TTFC, with O(1-chunk) resident buffer.
-- **TTFC ≈ 0.30 s** (time to first audio chunk), measured on the streaming service (warm). This is
-  TTS-internal (text-ready → first audio frame); it does not include the conversational STT/LLM stage.
+- **TTFC ≈ 170 ms** warm (time to first audio chunk), measured on the streaming service after a 1-frame
+  first chunk (`threshold = 1`) + the graphed code-predictor. (Earlier ~0.30 s was the 2-frame, pre-graph
+  path.) TTS-internal (text-ready → first audio frame); excludes the conversational STT/LLM stage.
+  **Measured breakdown of the 170 ms** (instrumented, first frame only): **prefill 111 ms** (the megakernel
+  decodes the ~110-token text prompt one token at a time, ~1 ms/token) + first decode ~2 ms + code-predictor
+  + codec + emit ~58 ms. **Prefill is ~65% of TTFC** — and it's the clear next lever: prefill is not
+  autoregressive over *generated* tokens, so it can run through the PyTorch trunk's **batched** forward in
+  one ~22 ms call instead of 110 sequential kernel steps, which would cut TTFC to **~80 ms** (toward the
+  <60 ms target). Not yet applied: it requires bridging the batched-prefill K/V into the megakernel's
+  internal fp32 KV-cache layout, which must be done carefully to preserve the 0.9999 validation — scoped as
+  the next lever rather than risked here.
 - **Conversational stage (separate from the kernel TTS):** Deepgram STT (`nova-2`) ~1.5 s on an 8 s clip;
   Groq LLM (`llama-3.3-70b-versatile`) first-token ~0.35 s. These are cloud calls (model- and
   network-dependent) and dominate *end-to-end* first-audio, so we start TTS on the

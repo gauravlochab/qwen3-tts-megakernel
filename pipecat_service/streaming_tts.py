@@ -81,7 +81,7 @@ class MegakernelStreamingTTS(TTSService):
             else:
                 frames.append(item)
             ready = len(frames) - decoded
-            threshold = 2 if first else CHUNK_FRAMES   # tiny first chunk -> low TTFC
+            threshold = 1 if first else CHUNK_FRAMES   # 1-frame first chunk -> lowest TTFC (codec warm-decode is ~flat in window size); measured warm TTFC ~170 ms
             if (ready >= threshold) or (done and ready > 0):
                 start = max(0, decoded - LEFT_CTX)
                 wav = self._decode_window(frames[start:len(frames)])

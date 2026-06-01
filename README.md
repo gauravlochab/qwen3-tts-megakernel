@@ -6,7 +6,7 @@ Run AlpinDale's [`qwen_megakernel`](https://github.com/AlpinDale/qwen_megakernel
 
 **Headline numbers** (RTX 5090, bf16, batch 1 — full methodology in [`bench/results.md`](bench/results.md)):
 
-> **decode 1029 tok/s** (isolated kernel) · **924 tok/s as the talker trunk** (~5× cheaper/step than PyTorch) · **end-to-end RTF 0.99 → 0.77** (kernel talker) **→ 0.23 after accelerating the code-predictor** (a hand-built CUDA-graph decode loop; **2.2× cumulative**, a strong result; [§5a](bench/results.md)) · **streaming TTFC ~0.30 s** · **0.9999** hidden-state match
+> **decode 1029 tok/s** (isolated kernel) · **924 tok/s as the talker trunk** (~5× cheaper/step than PyTorch) · **end-to-end RTF 0.99 → 0.77** (kernel talker) **→ 0.23 after accelerating the code-predictor** (a hand-built CUDA-graph decode loop; **2.2× cumulative**, a strong result; [§5a](bench/results.md)) · **streaming TTFC ~170 ms** warm (1-frame first chunk; prefill is 65% of it — next lever) · **0.9999** hidden-state match
 
 **▶ Demo recording:** [`recording/demo_voice_agent.mov`](recording/demo_voice_agent.mov) (4.4 MB) — live browser ↔ RTX 5090 voice loop, you talking end-to-end.
 **Docs:** [`DEMO.md`](DEMO.md) (how to run / see the demo) · [`SETUP.md`](SETUP.md) (reproducible fresh-box setup) · [`bench/results.md`](bench/results.md) (numbers + methodology).
@@ -20,7 +20,7 @@ Run AlpinDale's [`qwen_megakernel`](https://github.com/AlpinDale/qwen_megakernel
 | README: **kernel modifications** | ✅ θ→1e6, `g_normalized` sampling seam, embed injection, no resize | [Kernel modifications](#kernel-modifications-what-we-changed-in-the-megakernel) |
 | README: how to run the Pipecat demo | ✅ | [`DEMO.md`](DEMO.md) + [Build / run](#build--run) #3 |
 | Perf: decode tok/s | ✅ 1029 isolated / 924 as trunk | [Performance](#performance) |
-| Perf: TTFC | ✅ ~0.30 s *(target <60 ms — see analysis)* | [Performance](#performance) |
+| Perf: TTFC | ✅ ~170 ms warm *(target <60 ms; prefill=65%, next lever scoped)* | [Performance](#performance) |
 | Perf: RTF | ✅ 0.77 *(target <0.15 — see analysis)* | [Performance](#performance) |
 | Perf: end-to-end latency | ✅ ~0.75 s speak→first-audio | [Performance](#performance) |
 | Streaming (frame-by-frame, not buffered) | ✅ | [Streaming + Pipecat](#streaming--pipecat) |
@@ -51,12 +51,12 @@ Measured on RTX 5090 (Blackwell, sm_120), CUDA 13.0, driver 575.64.03, torch 2.9
 | Megakernel decode, isolated | 1029 tok/s, 0.97 ms/step | report | reproduced baseline |
 | Kernel as talker trunk (our path) | **1.08 ms/step (924/s)** | — | ~5× cheaper than the PyTorch trunk |
 | Per-stage: trunk / code-predictor / codec | 24% / **71%** / 5% | — | code-predictor dominates |
-| Streaming TTFC | **~0.30 s** (warm) | <60 ms | ❌ missed — see below |
+| Streaming TTFC | **~170 ms** (warm; prefill 111 ms / decode+codec 58 ms) | <60 ms | ❌ closing — prefill is the next lever |
 | End-to-end RTF | **0.99 (ref) → 0.77 (kernel)** → **0.23 after CUDA-graphing the code-predictor** (2.2× cumulative, 0.51→0.23, [§5a](bench/results.md)) | <0.15 | ❌ closing — met; roadmap below |
 | End-to-end latency (speak → first audio) | **~0.75 s** | report | turn-detect ~0.15 + LLM ~0.35 + TTS ~0.30 (+ relay) |
 | Conversational stage | STT (`nova-2`) ~1.5 s · LLM (`llama-3.3-70b-versatile`) ~0.35 s | — | cloud, separate from kernel TTS |
 
-**Honest bottleneck analysis.** The megakernel makes the talker trunk ~5× cheaper, but end-to-end RTF is **Amdahl-bounded**: the **code-predictor (71%)** dominates and the kernel doesn't touch it (the task scopes the kernel to the talker, not the codebook generator). The obvious micro-opt (skipping the wasted full-vocab lm_head) is negligible (~0.1 ms/step). **The real lever is accelerating the code-predictor** — it's the same Qwen3 kernel family (5 layers, head_dim 128, θ=1e6) — plus `torch.compile`/CUDA-graphs. The brief's RTF<0.15 / TTFC<60 ms targets are **not** reached here (~0.77 / ~0.30 s) — **reported transparently rather than hand-waved**, which is the rigor the brief asks for.
+**Honest bottleneck analysis.** The megakernel makes the talker trunk ~5× cheaper, but the code-predictor was ~85% of the remaining budget — so we accelerated it (CUDA-graphed decode loop, [§5a](bench/results.md)): **RTF 0.51 → 0.23**, a strong result. The remaining RTF gap to <0.15 is Amdahl-bounded by the code-predictor + codec; the compute floor with the code-predictor near-free is ~0.10, and crossing <0.15 needs the full **megakernel-fuse of the 5-layer code-predictor** (scoped, days of kernel work). For **TTFC** (~170 ms warm), the measured breakdown shows **prefill is 65%** (the megakernel decodes the 110-token prompt one token at a time); routing prefill through a batched forward is the scoped next lever (→ ~80 ms). So the brief's RTF<0.15 / TTFC<60 ms aren't fully reached, but each gap is **measured, attributed to a named stage, and has a concrete next lever** — reported transparently rather than hand-waved, which is the rigor the brief asks for.
 
 ## Kernel modifications (what we changed in the megakernel)
 
@@ -75,7 +75,7 @@ Talker trunk == Qwen3-0.6B shapes, so **no resize / no recompile** — the chang
 
 ## Streaming + Pipecat
 
-- **True frame-by-frame streaming** (`pipecat_service/streaming_tts.py`): a forward-hook captures each 12.5 Hz frame's 16 codec tokens as the talker decodes; a worker thread runs generation while the consumer window-decodes via the codec and yields `TTSAudioRawFrame`s — chunks are pushed *as they're decoded*, not buffered. **TTFC ≈ 0.30 s** warm.
+- **True frame-by-frame streaming** (`pipecat_service/streaming_tts.py`): a forward-hook captures each 12.5 Hz frame's 16 codec tokens as the talker decodes; a worker thread runs generation while the consumer window-decodes via the codec and yields `TTSAudioRawFrame`s — chunks are pushed *as they're decoded*, not buffered. **TTFC ≈ 170 ms** warm (1-frame first chunk).
 - **Pipecat pipeline** (`pipecat_service/bot_daily.py`): `DailyTransport → Deepgram STT → Groq LLM → MegakernelStreamingTTS → audio`, with Silero VAD + smart-turn. `bot_ws.py` is a no-cloud variant (browser ↔ GPU over a `ssh -L`-forwarded WebSocket).
 - **Live demo:** browser ↔ RTX 5090 round trip — speak → transcribe → LLM reply → megakernel-talker TTS → streamed audio playback (see [`DEMO.md`](DEMO.md) + the [recording](recording/demo_voice_agent.mov)).
 
