@@ -59,6 +59,25 @@ reproduce on your hardware (it prints per-run RTF for the reference and kernel p
   hidden 1024, head_dim 128, 16/8 heads, θ=1e6). Driving it on the same megakernel, or batching/CUDA-graphing
   its 15 per-frame depth-steps, attacks the real 71%. This is the highest-leverage next step.
 
+## 5a. Optimization APPLIED — `torch.compile` the code-predictor (measured win)
+
+We acted on the analysis above. The code-predictor runs `code_predictor.generate(max_new_tokens=15)` — 15
+sequential HF decode steps per 12.5 Hz frame, each at seqlen-1 / batch-1 → ~700 tiny kernel launches/frame,
+**launch-bound, not compute-bound**. Wrapping `code_predictor.model` in `torch.compile` (Inductor fusion;
+one line in `build_kernel_tts`) gives, on an RTX 5090 (3 runs each, same prompt):
+
+| | code-predictor | share of total | end-to-end RTF |
+|---|---|---|---|
+| Before (eager) | **35.1 ms/frame** | 85% | **0.513** |
+| After (`torch.compile`) | **18.8 ms/frame** | 75% | **0.314** |
+| | **1.87× on the stage** | | **1.63× end-to-end** |
+
+Numerically faithful: max abs waveform diff vs eager ≈ **1e-4**. Enabled by default; `MEGAKERNEL_COMPILE_CP=0`
+disables it. **Why not `mode="reduce-overhead"`** (CUDA-graph trees, the bigger win): it `AssertionError`s on
+the code-predictor's KV-cache aliasing across the depth loop — getting CUDA-graphs to hold requires a static
+KV cache + graph-safe sampling (the noted next lever, ~2.5–3× on the stage), and beyond that the full
+megakernel-fuse of the 5-layer stack. This `torch.compile` win is the safe, shipped first step on that path.
+
 ## 6. Streaming, TTFC, and the brief's targets — stated honestly
 
 - **Streaming: implemented and confirmed frame-by-frame.** `pipecat_service/streaming_tts.py` hooks the
