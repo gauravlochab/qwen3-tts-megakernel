@@ -9,3 +9,7 @@ hf/
 qwen_megakernel/
 Qwen3-TTS/
 .DS_Store
+.env
+*.env
+*.pem
+id_rsa*

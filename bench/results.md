@@ -31,12 +31,18 @@ full-vocab lm_head. Only ~0.11 ms/step above the nosync baseline → the integra
 
 | Pipeline | RTF | Notes |
 |---|---:|---|
-| Reference (PyTorch talker, sdpa) | ~0.99 | baseline |
-| **Megakernel talker** | **~0.77** | 3 runs: 0.770 / 0.766 / 0.768 |
+| Reference (PyTorch talker, sdpa) | ~0.99 | baseline (box A) |
+| **Megakernel talker** | **~0.77** | box A, 3 runs: 0.770 / 0.766 / 0.768 |
 
 The megakernel replaces the talker trunk (≈814 ms → ≈165 ms for a ~152-step utterance, ~5× cheaper),
 which moves end-to-end RTF from ~0.99 to ~0.77. The gain is **Amdahl-bounded**: the talker was never the
 wall.
+
+**Reproduced on a second box** (CUDA 12.9 / torch 2.9.1+cu128, `bench/stage_benchmark.py`): RTF
+**~0.84 (reference) → ~0.52 (megakernel)**, 3 runs each. Absolute RTF is box-dependent (CUDA/driver,
+clocks), but the **finding is identical on both machines**: the megakernel materially lowers end-to-end
+RTF, and the code-predictor remains the dominant residual cost. Run `bench/stage_benchmark.py` to
+reproduce on your hardware (it prints per-run RTF for the reference and kernel paths).
 
 ## 5. Honest bottleneck analysis & where the real win is
 

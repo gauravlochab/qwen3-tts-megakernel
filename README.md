@@ -56,11 +56,12 @@ Full methodology + analysis in [`bench/results.md`](bench/results.md). (The pipe
 
 ```
 SETUP.md          fresh-box runbook (RTX 5090) + reproducible env
-scripts/          setup_box.sh (one-shot env), reference_run.py, inspect_weights.py
+scripts/          setup_box.sh (one-shot env), reference_run.py, inspect_weights.py, demo_e2e.py (server-side STT→LLM→TTS)
 requirements_frozen.txt   exact pinned versions
 talker/           validate_talker_trunk.py (0.9999 match), megakernel_talker.py (kernel-driven synthesis)
-bench/            results.md, kernel_step_bench.py
-pipecat_service/  megakernel_tts_service.py, streaming_tts.py, bot_daily.py (Daily demo), bot_ws.py + index.html (local WS demo)
+bench/            results.md, kernel_step_bench.py (trunk per-step), stage_benchmark.py (§3-4 per-stage + RTF)
+pipecat_service/  megakernel_tts_service.py, streaming_tts.py, bot_daily.py (Daily demo), bot_ws.py + index.html (local WS demo), bot.py (SmallWebRTC variant; superseded by bot_daily.py — NAT/ICE issues from a headless box)
+recording/        demo_voice_agent.mov (end-to-end voice-agent demo)
 ```
 
 ## Build / run
@@ -68,7 +69,8 @@ pipecat_service/  megakernel_tts_service.py, streaming_tts.py, bot_daily.py (Dai
 Fresh-box setup (env + deps) is in **[`SETUP.md`](SETUP.md)** via `scripts/setup_box.sh` (clean venv, torch, all pinned deps, editable `qwen_tts`, verify). Then:
 
 ```bash
-# RTX 5090 box (CUDA 12.8+ devel image). Weights download on first run via HF_HOME + HF_TOKEN.
+# RTX 5090 box (CUDA 13.0 -devel image; also runs on CUDA 12.9 / torch 2.9.1+cu128 — see SETUP.md).
+# Weights download on first run via HF_HOME + HF_TOKEN.
 export HF_HOME=/workspace/hf PYTHONPATH=/workspace/qwen_megakernel
 
 # 1. Validation + kernel-driven synthesis
@@ -78,11 +80,15 @@ PYTHONPATH=$PYTHONPATH python talker/megakernel_talker.py       # kernel-driven 
 # 2. Benchmarks
 python -m qwen_megakernel.bench                                  # isolated megakernel tok/s
 PYTHONPATH=$PYTHONPATH python bench/kernel_step_bench.py         # trunk per-step
+PYTHONPATH=$PYTHONPATH python bench/stage_benchmark.py           # per-stage breakdown + end-to-end RTF (§3-4)
 
 # 3. Live Pipecat voice demo (needs DEEPGRAM_API_KEY, GROQ_API_KEY, DAILY_API_KEY in /opt/cfg/.env)
 PYTHONPATH=$PYTHONPATH python pipecat_service/bot_daily.py       # prints a Daily ROOM_URL to open in a browser
 # or, no cloud (browser <-> GPU over an ssh -L tunnel):
 PYTHONPATH=$PYTHONPATH python pipecat_service/bot_ws.py          # open http://localhost:8000 via ssh -L 8000:localhost:8000
+
+# 4. Server-side end-to-end (no browser): real speech -> STT -> LLM -> kernel TTS -> demo_conversation.wav
+PYTHONPATH=$PYTHONPATH python scripts/demo_e2e.py
 ```
 
 ## Credits

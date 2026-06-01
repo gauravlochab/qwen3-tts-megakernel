@@ -31,4 +31,7 @@ variant. Tightening sampling (repetition penalty / low temperature) was tried an
 
 True frame-by-frame streaming is implemented in `pipecat_service/streaming_tts.py`: audio chunks are
 emitted **as the talker decodes** (first chunk << total), satisfying "push chunks as decoded, do NOT
-buffer". Measured TTFC ~2 s (small first chunk, incl. one-time cold start) vs ~30 s for buffer-then-send.
+buffer". **TTFC ≈ 0.30 s warm** (streaming self-test, the steady-state demo condition); the very first
+utterance after process start is higher (~2 s) due to one-time CUDA/codec cold-start. Both are far below
+the ~full-utterance latency of buffer-then-send. (Brief target is <60 ms — see `bench/results.md` §6 for
+the honest gap analysis.)
