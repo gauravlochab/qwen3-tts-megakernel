@@ -63,37 +63,44 @@ def build_kernel_tts(model_path="Qwen/Qwen3-TTS-12Hz-0.6B-Base"):
         last = hid.unsqueeze(0)
         return BaseModelOutputWithPast(last_hidden_state=last, past_key_values=pkv, hidden_states=(last,))
     trunk.forward = types.MethodType(kf, trunk)
-    # Optimization (measured): the 5-layer code-predictor is the ~85% bottleneck (15 autoregressive
-    # depth-steps/frame at seqlen-1/batch-1 -> ~700 tiny kernel launches/frame, DISPATCH-bound). Two
-    # shippable accelerations, both validated on an RTX 5090 (end-to-end RTF, audio healthy):
+    # Optimization (measured on RTX 5090, bf16, batch 1): the 5-layer code-predictor runs 15
+    # autoregressive depth-steps per talker frame at seqlen-1/batch-1. Its arithmetic is tiny (~24us
+    # of bf16 matmuls per frame), so the cost is almost entirely the launch/scheduling latency of the
+    # many small kernels it issues — it is dispatch-bound, not compute-bound. Three shippable
+    # accelerations of the code-predictor, all validated end-to-end (RTF + healthy audio + a
+    # teacher-forced logit-cosine fidelity gate vs the reference forward, mean cosine 0.9999):
     #
-    #   (A) MEGAKERNEL_GRAPH_CP=1 (default, best): a HAND-CAPTURED CUDA graph of the WHOLE per-frame
-    #       depth loop (graphed_code_predictor_v2.py) — folds the 2-token prefill + all 15 decode
-    #       forwards + the 15 lm_head matmuls + top-k/softmax/multinomial sampling + next-token embed
-    #       into ONE captured graph (only cache.reset() + input copy_ + graph.replay() per frame).
-    #       Measured CP ~35 -> ~11 ms/frame, end-to-end RTF ~0.51 -> ~0.21. (v1, graphed_code_predictor.py,
-    #       graphed only the model forward and left lm_head+sampling eager -> ~12.5 ms/frame, RTF 0.23.)
-    #       This is the win HF generate can't get itself: its reduce-overhead path AssertionErrors on a
-    #       dynamic cache and, with a static cache, the per-step in-place KV index_copy_ trips cudagraph-
-    #       trees; we sidestep it by controlling capture/replay over a StaticCache + static I/O buffers.
-    #   (B) MEGAKERNEL_COMPILE_CP=1 (fallback): torch.compile(max-autotune-no-cudagraphs) -> ~17 ms/frame,
-    #       RTF ~0.29. Pure-fusion, no graph fragility; used when graph is disabled or unavailable.
+    #   (v3) MEGAKERNEL_GRAPH_CP=1 + MEGAKERNEL_CP_VARIANT=v3 (default, best): a hand-written GQA
+    #        forward (raw RMSNorm + matmuls + per-head qk-norm + RoPE + static-shape attention over a
+    #        fixed [16,16] causal mask, fp32 KV) replaces the HF module body; the WHOLE unrolled frame
+    #        (2-token prefill + 15 depth steps + 15 lm_heads + Gumbel-max sampling + next-token embed)
+    #        is compiled ONCE by Inductor (max-autotune-no-cudagraphs) so the rmsnorm/rope/silu chains
+    #        fuse into matmul epilogues, then captured in one CUDA graph so host launch overhead also
+    #        goes away. Measured CP ~10.8 -> ~3.0 ms/frame, end-to-end RTF ~0.20 -> ~0.11.
+    #   (v2) graphed_code_predictor_v2.py: the same whole-frame CUDA graph but over the HF Qwen3 module
+    #        body (no hand-written GQA, no Inductor fusion): CP ~10.8 ms/frame, RTF ~0.20. Fallback.
+    #   (v1) graphed_code_predictor.py: graphs only the model forward, lm_head + sampling stay eager:
+    #        CP ~12.5 ms/frame, RTF ~0.23. Final fallback.
     #
-    # Numerically: the graph's StaticCache differs from the default DynamicCache by ~ulp (flips greedy
-    # argmax only on near-ties; within the model's temperature-0.9 sampling stochasticity; multinomial is
-    # graph-capturable and its philox RNG advances across replays). Falls back to v1 then stock generate
-    # on any failure. Disable all with MEGAKERNEL_GRAPH_CP=0 MEGAKERNEL_COMPILE_CP=0.
+    # Numerically the graphed paths differ from stock generate only by fp near-ties (greedy argmax
+    # flips on ~ulp differences, within the temperature-0.9 sampling stochasticity; a single flip then
+    # amplifies through the autoregressive depth loop). The first-step prediction matches stock 100%.
+    # Install falls through v3 -> v2 -> v1 -> stock on any failure. The Inductor compile autotunes on
+    # first use (~minutes); prewarm_kernel_tts() pays this at boot. Disable with MEGAKERNEL_GRAPH_CP=0.
     if os.environ.get("MEGAKERNEL_GRAPH_CP", "1") == "1":
-        try:
-            from graphed_code_predictor_v2 import install_graphed_code_predictor
-            install_graphed_code_predictor(tts)
-        except Exception as e:
-            print("graphed code-predictor v2 skipped, trying v1:", e, flush=True)
+        variant = os.environ.get("MEGAKERNEL_CP_VARIANT", "v3")
+        chain = {
+            "v3": ["graphed_code_predictor_v3", "graphed_code_predictor_v2", "graphed_code_predictor"],
+            "v2": ["graphed_code_predictor_v2", "graphed_code_predictor"],
+            "v1": ["graphed_code_predictor"],
+        }.get(variant, ["graphed_code_predictor_v3", "graphed_code_predictor_v2", "graphed_code_predictor"])
+        for _mod in chain:
             try:
-                from graphed_code_predictor import install_graphed_code_predictor
-                install_graphed_code_predictor(tts)
-            except Exception as e2:
-                print("graphed code-predictor skipped:", e2, flush=True)
+                __import__(_mod).install_graphed_code_predictor(tts)
+                print(f"code-predictor acceleration: {_mod}", flush=True)
+                break
+            except Exception as e:
+                print(f"{_mod} unavailable, trying next: {e}", flush=True)
     elif os.environ.get("MEGAKERNEL_COMPILE_CP", "1") == "1":
         try:
             tts.model.talker.code_predictor.model = torch.compile(
@@ -104,10 +111,11 @@ def build_kernel_tts(model_path="Qwen/Qwen3-TTS-12Hz-0.6B-Base"):
 
 
 # Startup warmup (zero risk to 0.9999 — warmup/scheduling only). Captures the code-predictor CUDA graph
-# at boot with the SERVICE sampling params so it does NOT recapture on the first user turn (the lazy
-# capture is a one-time ~1.1s cost that would otherwise land on the first reply); warms the vocoder with
-# varied codes (a same-input warmup only primes the internal cache and is misleading); and warms the
-# sampler (multinomial/softmax/topk). Call once at startup BEFORE serving.
+# at boot with the SERVICE sampling params so it does NOT recapture on the first user turn (the v3 path
+# also autotunes its Inductor compile here, a one-time ~minutes cost that would otherwise land on the
+# first reply); warms the vocoder with varied codes (a same-input warmup only primes the internal cache
+# and is misleading); and warms the sampler (Gumbel-max / softmax / topk). Call once at startup BEFORE
+# serving.
 def prewarm_kernel_tts(tts, ref_audio, ref_text, gen=None):
     g = gen or dict(max_new_tokens=64, do_sample=True, top_k=50, top_p=1.0, temperature=0.9,
                     repetition_penalty=1.05, subtalker_dosample=True, subtalker_top_k=50,
@@ -119,8 +127,8 @@ def prewarm_kernel_tts(tts, ref_audio, ref_text, gen=None):
             tts.model.speech_tokenizer.decode([{"audio_codes": codes}])
     except Exception as e:
         print("vocoder warmup skipped:", e, flush=True)
-    # 2) two full generations with the EXACT service params -> captures the CP CUDA graph at boot under
-    #    the real configuration (so turn 1 doesn't pay the ~1.1s recapture) + warms the sampler path.
+    # 2) two full generations with the EXACT service params -> compiles + captures the CP graph at boot
+    #    under the real configuration (so turn 1 doesn't pay the recapture) + warms the sampler path.
     try:
         for _ in range(2):
             tts.generate_voice_clone(text="Warming up the megakernel and the code-predictor CUDA graph now.",

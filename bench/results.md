@@ -35,36 +35,43 @@ full-vocab lm_head. Only ~0.11 ms/step above the nosync baseline → the integra
 | Pipeline | RTF | Notes |
 |---|---:|---|
 | Reference (PyTorch talker, sdpa) | ~0.99 | baseline (box A) |
-| **Megakernel talker** | **~0.77** | box A, 3 runs: 0.770 / 0.766 / 0.768 |
+| Megakernel talker | ~0.77 | box A, 3 runs: 0.770 / 0.766 / 0.768 |
+| Megakernel talker + accelerated code-predictor (v2) | ~0.20 | §5a |
+| **Megakernel talker + accelerated code-predictor (v3)** | **~0.11** | §5a — **clears the < 0.15 target** |
 
 The megakernel replaces the talker trunk (≈814 ms → ≈165 ms for a ~152-step utterance, ~5× cheaper),
-which moves end-to-end RTF from ~0.99 to ~0.77. The gain is **Amdahl-bounded**: the talker was never the
-wall.
+which moves end-to-end RTF from ~0.99 to ~0.77. That gain is **Amdahl-bounded** (the talker was never the
+wall); the rest of the way to RTF ~0.11 comes from accelerating the code-predictor, which is 71% of the
+budget (§5a).
 
 **Reproduced on box B** (a second RTX 5090, CUDA 12.9 / torch 2.9.1+cu128, `bench/stage_benchmark.py`):
 RTF **~0.84 (reference) → ~0.52 (megakernel)**, 3 runs each. Absolute RTF is box-dependent (CUDA/driver,
 clocks), but the **finding is identical on both machines**: the megakernel materially lowers end-to-end
-RTF, and the code-predictor remains the dominant residual cost. Run `bench/stage_benchmark.py` to
-reproduce on your hardware (it prints per-run RTF for the reference and kernel paths).
+RTF, and the code-predictor is the dominant residual cost. Run `bench/stage_benchmark.py` to reproduce on
+your hardware (it prints per-run RTF for the reference and kernel paths).
 
 ## 5. Honest bottleneck analysis & where the real win is
 
 - **The talker is not the bottleneck.** At 12.5 Hz it needs ~12.5 tokens/s; the kernel does ~924/s. The
   megakernel makes an already-cheap stage cheaper.
 - **The code-predictor is 71% of the budget** and the megakernel does not touch it (the task scopes the
-  kernel to the talker, not the "codebook generator"). This is *why* end-to-end RTF only improves modestly.
+  kernel to the talker, not the "codebook generator"). This is *why* the kernel-talker-only RTF is ~0.77.
 - **The micro-opt that looks obvious is negligible:** skipping the wasted full-vocab (151,936) lm_head saves
   ~0.1 ms/step (measured) — not worth a kernel recompile.
-- **The optimization that matters (bonus):** the code-predictor is the *same Qwen3 kernel family* (5 layers,
-  hidden 1024, head_dim 128, 16/8 heads, θ=1e6). Driving it on the same megakernel, or batching/CUDA-graphing
-  its 15 per-frame depth-steps, attacks the real 71%. This is the highest-leverage next step.
+- **The optimization that matters (bonus), and what actually won it:** the code-predictor is the *same
+  Qwen3 kernel family* (5 layers, hidden 1024, head_dim 128, 16/8 heads, θ=1e6). We first asked whether to
+  drive it on the same megakernel, but profiling showed its 15 depth-steps/frame are **launch-latency-bound,
+  not compute-bound** — the per-frame bf16 arithmetic is only ~24 µs, while the realized cost is milliseconds
+  spent dispatching ~hundreds-to-thousands of tiny kernels. So the win is **fewer/cheaper kernels**, not a
+  custom kernel: a hand-written GQA forward + whole-frame Inductor fusion + a single CUDA-graph capture (v3,
+  §5a) reaches RTF **~0.11** with no changes to the megakernel itself.
 
-## 5a. Optimization APPLIED — accelerate the code-predictor (measured, 2.2× end-to-end)
+## 5a. Optimization APPLIED — accelerate the code-predictor (measured, ~9× end-to-end)
 
 We acted on the analysis above. The code-predictor runs `code_predictor.generate(max_new_tokens=15)` — 15
-sequential HF decode steps per 12.5 Hz frame, each at seqlen-1 / batch-1 → ~700 tiny kernel launches/frame,
+sequential decode steps per 12.5 Hz frame, each at seqlen-1 / batch-1 → many tiny kernel launches/frame,
 **dispatch-bound, not compute-bound** (an isolated step is **5.06×** faster under a CUDA graph — proof it's
-launch overhead). Two shippable accelerations, measured on an RTX 5090 (3 runs each, same prompt; audio healthy):
+launch overhead). Successive accelerations, measured on an RTX 5090 (same prompt; audio healthy):
 
 | Config | code-predictor | share | end-to-end RTF | cumulative |
 |---|---|---|---|---|
@@ -72,29 +79,45 @@ launch overhead). Two shippable accelerations, measured on an RTX 5090 (3 runs e
 | `torch.compile` (default) | 18.8 ms/frame | 75% | 0.314 | 1.63× |
 | `torch.compile` `max-autotune-no-cudagraphs` | 17.1 ms/frame | 73% | 0.288 | 1.78× |
 | hand-captured CUDA graph, v1 (model fwd only) | 12.5 ms/frame | 68% | 0.230 | 2.23× |
-| **whole-frame CUDA graph, v2** (default, `MEGAKERNEL_GRAPH_CP=1`) | **~11 ms/frame** | 65% | **0.208** | **2.47×** |
+| whole-frame CUDA graph, v2 (HF module body) | ~10.8 ms/frame | 67% | 0.202 | 2.5× |
+| **hand-written GQA + Inductor-fused whole frame + CUDA graph, v3** (default) | **~3.0 ms/frame** | 35% | **~0.11** | **~9×** |
 
-v2 (`graphed_code_predictor_v2.py`) folds the *entire* per-frame work — 2-token prefill + 15 decode
-forwards + 15 `lm_head` matmuls + top-k/softmax/multinomial sampling + next-token embed — into ONE
-captured graph (per frame: only `cache.reset()` + an input `copy_()` + `graph.replay()`). RTF **0.230 → 0.208**,
-audio healthy (rms 0.033), independently re-measured via `baseline_bench.py` (3 runs: 0.208/0.208/0.212).
-`multinomial` is graph-capturable and its philox RNG counter advances across replays, so sampling stays
-correct under capture.
+**v2** (`graphed_code_predictor_v2.py`) folds the *entire* per-frame work — 2-token prefill + 15 decode
+forwards + 15 `lm_head` matmuls + sampling + next-token embed — into ONE captured graph, but the body is
+still the HF Qwen3 module, so the graph records HF's full attention machinery (SDPA over a padded
+`StaticCache`, per-step `index_copy_`, dtype shuffling). That left CP at ~10.8 ms/frame (RTF ~0.20), and
+profiling showed the residual is *kernel count*, not arithmetic.
 
-RTF **0.513 → 0.230** end-to-end, audio rms unchanged (~0.07–0.09 = healthy speech), and the whole-frame
-CUDA-graph build (§5a) takes it further to ~0.21.
+**v3** (`graphed_code_predictor_v3.py`, default) attacks the kernel count directly:
+- **Hand-written GQA forward** — raw RMSNorm + matmuls + per-head q/k-norm + θ=1e6 RoPE + a static-shape
+  attention over a fixed `[16,16]` causal mask with an explicit fp32 KV cache + SiLU MLP — replacing the
+  HF module body, so only the kernels the math needs are issued.
+- **Whole unrolled frame compiled ONCE by Inductor** (`max-autotune-no-cudagraphs`, `fullgraph=True`): the
+  rmsnorm / RoPE / SiLU elementwise chains fuse into the matmul epilogues, collapsing ~thousands of tiny
+  kernels into a handful of fused ones. Compiling the *whole* frame (not per-position) avoids per-step
+  recompilation.
+- **One manual CUDA-graph capture** of the fused frame removes the remaining host launch overhead. Capture
+  + replay run under `no_grad` so Inductor traces the in-place KV writes without autograd version counters.
+- **Gumbel-max sampling** (`argmax(logits/temp + Gumbel)` ≡ categorical(softmax(logits/temp))) with the
+  noise refreshed outside the graph, plus GPU-gather of the next-token embedding (a `[1]`-shaped index,
+  never a 0-dim scalar — a scalar index forces a bounds-check sync that invalidates capture).
+
+Measured: CP **10.8 → 3.0 ms/frame**, end-to-end RTF **0.20 → ~0.107** (5 runs: 0.114/0.106/0.109/0.105/0.107),
+CP share 67% → 35%, audio healthy (rms 0.057–0.095, sampling live). **The < 0.15 RTF target is met with margin.**
+
+**Correctness gate (v3).** A teacher-forced logit-cosine check vs stock `generate` over 16 random contexts:
+**mean cosine 0.999923, min 0.998753** per depth-step — the hand-written forward is numerically faithful.
+End-to-end greedy decode matches stock **100% at the first prediction** and degrades only downstream, which
+is pure autoregressive amplification (a single ~ulp near-tie flip changes every later input), *not* a forward
+bug — the identical divergence pattern the shipped v2 has, within the temperature-0.9 sampling stochasticity.
+Default on; install falls through v3 → v2 → v1 → stock `generate` on any failure.
 
 **Making CUDA graphs hold — the lever HF generate can't get itself.** `mode="reduce-overhead"` fails on this
 model: a dynamic cache `AssertionError`s in cudagraph-trees, and forcing `cache_implementation="static"` then
 hits *"tensor output of CUDAGraphs overwritten by a subsequent run"* (the static-KV `.generate()` does an
-in-place `index_copy_` into the KV every depth-step, which cudagraph-trees can't manage across the loop, even
-with `cudagraph_mark_step_begin()`). We sidestep it in `pipecat_service/graphed_code_predictor.py`: a hand-built
-decode loop over a `StaticCache` + static input/position/cache buffers, the 5-layer `model.forward` captured
-**once** as a `torch.cuda.CUDAGraph` and replayed 15×/frame via `copy_()`/`fill_()`; lm_head + sampling stay
-eager. Correctness: the manual loop is **bit-exact vs stock `generate()` on a DynamicCache**; the StaticCache
-needed for graphs differs by ~ulp (flips greedy argmax only on near-ties — within the model's temperature-0.9
-sampling stochasticity). Default on; falls back to stock `generate` on any failure. **Next lever:** the full
-megakernel-fuse of the 5-layer stack (toward the documented ~0.15–0.18 floor).
+in-place `index_copy_` into the KV every depth-step, which cudagraph-trees can't manage across the loop). We
+sidestep it by owning capture/replay over static buffers — v2 over a `StaticCache`, v3 over the hand-written
+fp32 KV — and, for v3, by compiling the frame before capture so the fused kernels are what get recorded.
 
 ## 6. Streaming, TTFC, and the brief's targets — stated honestly
 
@@ -113,23 +136,18 @@ megakernel-fuse of the 5-layer stack (toward the documented ~0.15–0.18 floor).
     path runs the identical body kernel without the lm_head → the hidden state is **bit-identical**
     (`val_L1.py`: max abs diff 0.000, cosine **1.0000000**), so the 0.9999 invariant holds by construction.
     Prefill kernel work dropped ~107 → ~84 ms; the streaming prefill stage ~111 → ~88 ms; warm TTFC
-    ~170 → ~162 ms; decode-path RTF unchanged (~0.20).
-  - **Why the end-to-end TTFC win is smaller than the raw lm_head saving:** the remaining ~88 ms prefill is
-    now the **per-token Python loop + embedding copies** (not the lm_head), and "other" is the first
-    code-predictor frame + codec. L1 is the safe, bit-exact win banked here.
-  - **Warmup pre-capture (applied):** the code-predictor's CUDA graph captures lazily on first use (a
-    one-time ~1.1 s cost). The bots now warm with the *service's real sampling params* (2 passes) at
-    startup so the graph is captured before the first user turn — first-reply TTFC ~220 ms → ~165 ms warm
-    (without it the first turn pays a recapture). Zero risk: warmup-only, no model math touched.
-  - **Honest remaining gap to <60 ms (profiled three ways).** Warm TTFC ~165 ms is **bounded by the real
+    ~170 → ~162 ms.
+  - **Warmup pre-capture (applied):** the code-predictor's CUDA graph (and, for v3, its one-time Inductor
+    autotune) builds lazily on first use. The bots warm with the *service's real sampling params* (2 passes)
+    at startup so this is paid before the first user turn — first-reply TTFC ~220 ms → ~165 ms warm. Zero
+    risk: warmup-only, no model math touched.
+  - **Honest remaining gap to <60 ms (profiled three ways).** Warm TTFC ~162 ms is **bounded by the real
     work to produce the first audio frame**: prefill (~88 ms, the 110-token host loop) + the first
-    code-predictor/codec frame (~70 ms). There is no cheap fix left. The two real levers — (a) **batch the
+    code-predictor/codec frame (now ~30 ms with v3, down from ~70 ms). The remaining lever is (a) **batch the
     prefill host loop** (replace 110 sequential kernel steps with a batched forward → prefill ~88→~25 ms,
-    TTFC ~100 ms; needs bridging prefill K/V into the kernel's fp32 cache layout, carefully, to keep
-    0.9999), and (b) the **code-predictor megakernel-fuse** (shrinks the first-frame cost) — are both
-    more invasive and are scoped as future work rather than risked. **TTFC<60 ms is reachable in pure
-    bf16** via lever (a) (the prefill is ~88 ms of dispatch overhead, not compute, so a batched prefill
-    closes most of the gap); we report the measured 165 ms honestly rather than overclaim.
+    TTFC ~60–90 ms; needs bridging prefill K/V into the kernel's fp32 cache layout, carefully, to keep
+    0.9999). **TTFC<60 ms is reachable in pure bf16** via lever (a) (the prefill is ~88 ms of dispatch
+    overhead, not compute); we report the measured 162 ms honestly rather than overclaim.
 - **Conversational stage (separate from the kernel TTS):** Deepgram STT (`nova-2`) ~1.5 s on an 8 s clip;
   Groq LLM (`llama-3.3-70b-versatile`) first-token ~0.35 s. These are cloud calls (model- and
   network-dependent) and dominate *end-to-end* first-audio, so we start TTS on the
@@ -138,10 +156,10 @@ megakernel-fuse of the 5-layer stack (toward the documented ~0.15–0.18 floor).
   (smart-turn) + LLM first-token ~0.35 s + TTS TTFC ~0.30 s warm (STT runs incrementally during the user's
   speech, so it is not on the critical path; Daily's WebRTC relay adds a further ~0.1–0.3 s of transport).
   Measured from the live `bot_daily.py` session logs.
-- **RTF.** Brief target RTF < 0.15. Achieved **~0.21** (single 5090, batch 1, kernel talker + whole-frame
-  CUDA-graph code-predictor; the PyTorch reference is ~0.99 and the kernel-talker-only point is ~0.77).
-  Reaching <0.15 requires the code-predictor megakernel-fuse + codec overlap (§5, §5a) — **future work**,
-  reported transparently rather than hand-waved.
+- **RTF.** Brief target RTF < 0.15. **Achieved ~0.11** (single 5090, batch 1, kernel talker + hand-written
+  GQA / Inductor-fused / CUDA-graphed code-predictor, v3). The PyTorch reference is ~0.99 and the
+  kernel-talker-only point is ~0.77; accelerating the code-predictor (§5a) takes it 0.77 → 0.20 (v2) →
+  **~0.11 (v3)**, clearing the < 0.15 target in pure bf16 (no quantization).
 - **Audio quality.** Clean speech on neutral text; on some text+voice combinations the **base 0.6B model**
   over-generates a trailing ramble past EOS — the pure-PyTorch reference does this *identically* (so it is a
   base-model trait, not a kernel artifact; the kernel matches the reference at 0.9999). A neutral reference
@@ -153,5 +171,7 @@ megakernel-fuse of the 5-layer stack (toward the documented ~0.15–0.18 floor).
 python -m qwen_megakernel.bench                      # §1 isolated megakernel
 PYTHONPATH=/path/to/qwen_megakernel python bench/kernel_step_bench.py   # §2 trunk per-step
 PYTHONPATH=/path/to/qwen_megakernel python bench/stage_benchmark.py     # §3-4 per-stage + RTF
+PYTHONPATH=/path/to/qwen_megakernel python bench/bench_cp_variants.py   # §5a v1/v2/v3 RTF + ms/frame
+PYTHONPATH=/path/to/qwen_megakernel python bench/correctness_cp.py      # §5a v3 teacher-forced cosine gate
 PYTHONPATH=/path/to/qwen_megakernel python pipecat_service/streaming_tts.py   # §6 streaming TTFC self-test
 ```
