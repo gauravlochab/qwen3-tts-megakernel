@@ -80,7 +80,9 @@ launch overhead). Successive accelerations, measured on an RTX 5090 (same prompt
 | `torch.compile` `max-autotune-no-cudagraphs` | 17.1 ms/frame | 73% | 0.288 | 1.78× |
 | hand-captured CUDA graph, v1 (model fwd only) | 12.5 ms/frame | 68% | 0.230 | 2.23× |
 | whole-frame CUDA graph, v2 (HF module body) | ~10.8 ms/frame | 67% | 0.202 | 2.5× |
-| **hand-written GQA + Inductor-fused whole frame + CUDA graph, v3** (default) | **~3.0 ms/frame** | 35% | **~0.11** | **~9×** |
+| **hand-written GQA + Inductor-fused whole frame + CUDA graph, v3** (default) | **~3.0 ms/frame** | 35% | **~0.11** | **~4.7×** |
+
+(The `cumulative` column is the speedup vs the eager-CP baseline (0.513); v3 is 0.513/0.11 ≈ **4.7×** on this axis. Against the *full PyTorch reference* (RTF 0.99) the v3 pipeline is **~9×** — that's the figure used in §4 and the README headline.)
 
 *Reproduce + absolute-RTF note:* the committed `bench/bench_cp_variants.py` (median of 5, `max_new_tokens=160`)
 reproduces v1/v2/v3 end-to-end RTF ≈ **0.20 / 0.18 / 0.09** on a fresh clone — same ordering, and v3

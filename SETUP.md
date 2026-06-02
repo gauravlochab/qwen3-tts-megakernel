@@ -78,7 +78,15 @@ First run JIT-compiles the megakernel (1-3 min) + warms the vocoder.
 ## Notes / gotchas
 - **Don't copy a venv between machines** — venvs hardcode absolute paths and large wheels copy as
   0-byte/stale inodes. Always rebuild via `setup_box.sh`.
-- **bot_ws.py** serves a single esbuild JS bundle (`pcbundle.js`) so the browser loads ONE copy of
-  `@pipecat-ai/client-js` (two copies -> `Class constructor E cannot be invoked without 'new'`).
-  Build it on the box: `cd bundle && npm i @pipecat-ai/client-js@1.10.0 @pipecat-ai/websocket-transport@1.6.5 esbuild && ./node_modules/.bin/esbuild entry.js --bundle --format=esm --target=es2022 --outfile=/workspace/pcbundle.js`.
+- **bot_ws.py is an OPTIONAL local / no-cloud path** — the canonical demo (and the recording) is
+  `bot_daily.py`, which needs no JS bundle. bot_ws.py serves a single esbuild bundle (`pcbundle.js`) so
+  the browser loads ONE copy of `@pipecat-ai/client-js` (two copies -> `Class constructor E cannot be
+  invoked without 'new'`). If you want it, build the bundle on the box (this creates the tiny re-export
+  entrypoint, then bundles it):
+  ```bash
+  mkdir -p /workspace/bundle && cd /workspace/bundle
+  printf 'export * from "@pipecat-ai/client-js";\nexport * from "@pipecat-ai/websocket-transport";\n' > entry.js
+  npm i @pipecat-ai/client-js@1.10.0 @pipecat-ai/websocket-transport@1.6.5 esbuild
+  ./node_modules/.bin/esbuild entry.js --bundle --format=esm --target=es2022 --outfile=/workspace/pcbundle.js
+  ```
 - SSH with `-N` for the tunnel (avoids `xterm-*` terminal errors closing the connection).

@@ -8,7 +8,7 @@ Run AlpinDale's [`qwen_megakernel`](https://github.com/AlpinDale/qwen_megakernel
 
 > **decode 1029 tok/s** (isolated kernel) · **924 tok/s as the talker trunk** (~5× cheaper/step than PyTorch) · **end-to-end RTF 0.99 (PyTorch reference) → 0.77 (kernel talker) → ~0.11 after accelerating the code-predictor** (hand-written GQA + whole-frame Inductor fusion + one CUDA graph; **~9× over the reference**; **clears the <0.15 target**; [§5a](bench/results.md)) · **streaming TTFC ~58 ms** warm median (**162 → 58 ms**, range 56–60 ms; batched-prefill KV-bridge at 0.9999 + a lock-free streaming handoff; **clears the <60 ms target**) · **0.9999** hidden-state match
 
-**▶ Demo recording:** [`recording/demo_voice_agent.mov`](recording/demo_voice_agent.mov) (4.4 MB) — live browser ↔ RTX 5090 voice loop, you talking end-to-end.
+**▶ Demo recording:** [`recording/demo_voice_agent.mov`](recording/demo_voice_agent.mov) (4.9 MB) — live browser ↔ RTX 5090 voice loop, you talking end-to-end.
 **Docs:** [`DEMO.md`](DEMO.md) (how to run / see the demo) · [`SETUP.md`](SETUP.md) (reproducible fresh-box setup) · [`bench/results.md`](bench/results.md) (numbers + methodology).
 
 ## Deliverables checklist
@@ -22,7 +22,7 @@ Run AlpinDale's [`qwen_megakernel`](https://github.com/AlpinDale/qwen_megakernel
 | Perf: decode tok/s | ✅ 1029 isolated / 924 as trunk | [Performance](#performance) |
 | Perf: TTFC | ✅ **~58 ms warm median (target <60 ms met)** *(162 → 58 ms; range 56–60 ms; batched prefill + lock-free handoff)* | [Performance](#performance) |
 | Perf: RTF | ✅ **~0.11 (target <0.15 met)** | [Performance](#performance) |
-| Perf: end-to-end latency | ✅ ~0.75 s speak→first-audio | [Performance](#performance) |
+| Perf: end-to-end latency | ✅ ~0.55 s speak→first-audio (was ~0.75 s before the TTFC optimizations) | [Performance](#performance) |
 | Streaming (frame-by-frame, not buffered) | ✅ | [Streaming + Pipecat](#streaming--pipecat) |
 | Demo recording (you talking, end-to-end) | ✅ | [`recording/demo_voice_agent.mov`](recording/demo_voice_agent.mov) |
 
@@ -51,7 +51,7 @@ Measured on RTX 5090 (Blackwell, sm_120), CUDA 13.0, driver 575.64.03, torch 2.9
 | Megakernel decode, isolated | 1029 tok/s, 0.97 ms/step | report | reproduced baseline |
 | Kernel as talker trunk (our path) | **1.08 ms/step (924/s)** | — | ~5× cheaper than the PyTorch trunk |
 | Per-stage: trunk / code-predictor / codec | 24% / **71%** / 5% | — | code-predictor dominated (before accel) |
-| Streaming TTFC | **~58 ms median** (warm; range 56–60 ms — prefill 13 ms / codec 17 ms / code-pred 11 ms / lock-free handoff) | <60 ms | ✅ **met** (162 → 58) |
+| Streaming TTFC | **~58 ms median** (warm; range 56–60 ms — prefill 13 ms / decode 4 ms / codec 17 ms / code-pred 11 ms / lock-free handoff) | <60 ms | ✅ **met** (162 → 58) |
 | End-to-end RTF | **0.99 (PyTorch ref) → 0.77 (kernel) → ~0.11 after accelerating the code-predictor** (~9×, [§5a](bench/results.md)) | <0.15 | ✅ **met** |
 | End-to-end latency (speak → first audio) | **~0.55 s** | report | turn-detect ~0.15 + LLM ~0.35 + TTS TTFC ~0.058 (+ relay) |
 | Conversational stage | STT (`nova-2`) ~1.5 s · LLM (`llama-3.3-70b-versatile`) ~0.35 s | — | cloud, separate from kernel TTS |
