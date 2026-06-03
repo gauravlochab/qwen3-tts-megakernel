@@ -6,7 +6,10 @@ Run AlpinDale's [`qwen_megakernel`](https://github.com/AlpinDale/qwen_megakernel
 
 **Headline numbers** (RTX 5090, bf16, batch 1 — full methodology in [`bench/results.md`](bench/results.md)):
 
-> **decode 1029 tok/s** (isolated kernel) · **924 tok/s as the talker trunk** (~5× cheaper/step than PyTorch) · **end-to-end RTF 0.99 (PyTorch reference) → 0.77 (kernel talker) → ~0.11 after accelerating the code-predictor** (hand-written GQA + whole-frame Inductor fusion + one CUDA graph; **~9× over the reference**; **clears the <0.15 target**; [§5a](bench/results.md)) · **streaming TTFC ~58 ms** warm median (**162 → 58 ms**, range 56–60 ms; batched-prefill KV-bridge at 0.9999 + a lock-free streaming handoff; **clears the <60 ms target**) · **0.9999** hidden-state match
+- **RTF ~0.11** — clears the **< 0.15** target  (0.99 PyTorch ref → 0.77 kernel talker → 0.11 after accelerating the code-predictor)
+- **TTFC ~58 ms** warm median — clears the **< 60 ms** target  (162 → 58 ms)
+- **Decode 1029 tok/s** isolated · 924 tok/s as the talker trunk (~5× cheaper/step than PyTorch)
+- **0.9999** talker hidden-state cosine vs the reference
 
 **▶ Demo recording:** [`recording/demo_voice_agent.mov`](recording/demo_voice_agent.mov) (4.9 MB) — live browser ↔ RTX 5090 voice loop, you talking end-to-end.
 **Docs:** [`DEMO.md`](DEMO.md) (how to run / see the demo) · [`SETUP.md`](SETUP.md) (reproducible fresh-box setup) · [`bench/results.md`](bench/results.md) (numbers + methodology).
@@ -56,7 +59,12 @@ Measured on RTX 5090 (Blackwell, sm_120), CUDA 13.0, driver 575.64.03, torch 2.9
 | End-to-end latency (speak → first audio) | **~0.55 s** | report | turn-detect ~0.15 + LLM ~0.35 + TTS TTFC ~0.058 (+ relay) |
 | Conversational stage | STT (`nova-2`) ~1.5 s · LLM (`llama-3.3-70b-versatile`) ~0.35 s | — | cloud, separate from kernel TTS |
 
-**Honest bottleneck analysis.** The megakernel makes the talker trunk ~5× cheaper, but the code-predictor was ~71% of the remaining budget — so we accelerated it. Profiling showed its 15 depth-steps/frame are **launch-latency-bound, not compute-bound** (the per-frame arithmetic is ~24 µs; the cost is dispatching many tiny kernels), so the win is *fewer kernels*, not a custom kernel: a **hand-written GQA forward + whole-frame Inductor fusion + a single CUDA-graph capture** ([§5a](bench/results.md)) takes the code-predictor from ~10.8 to ~3.0 ms/frame and **end-to-end RTF 0.77 → ~0.11**, clearing the **<0.15** target in pure bf16 (no quantization, no megakernel changes). Correctness held to a teacher-forced logit cosine of **0.9999** vs stock and a first-step greedy match of **100%** (later-step divergence is autoregressive amplification of fp near-ties, not a forward bug). For **TTFC**, the talker prefill was a per-token loop of 110 single-token kernel steps (~87 ms — the dominant term). Since the kernel stores post-qk-norm/post-RoPE K and raw V *identically* to HuggingFace's cache, we run the prefill as **one batched reference forward and bridge its per-layer K/V straight into the kernel's cache** (then the kernel does the single-token decode as before). Validated: the post-bridge decode hidden matches the full reference at **0.9999** — actually *better* than the per-token path, which accumulates the kernel's per-layer ~1e-4 across 28 layers (prefill **87 → 13 ms**). A second pass replaced the streaming consumer's per-frame `run_in_executor` queue-get with an **`asyncio.Queue` fed via `call_soon_threadsafe`**, removing the threadpool dispatch that was adding ~22 ms *and* all the run-to-run jitter (TTFC spread 59–131 ms → 56–60 ms). Warm TTFC **162 → ~58 ms median**. So **both brief targets are met — RTF ~0.11 < 0.15 and TTFC ~58 ms < 60 ms** — in pure bf16, with the talker on the megakernel and the code-predictor/codec in PyTorch as the task specifies.
+**Honest bottleneck analysis** *(full methodology + per-stage numbers in [`bench/results.md`](bench/results.md) §3–§6).* The megakernel makes the talker trunk ~5× cheaper, but the **code-predictor is ~71%** of the remaining budget — and it's **launch-latency-bound, not compute-bound** (~24 µs of arithmetic/frame, but milliseconds spent dispatching many tiny kernels). Two measured wins, both pure bf16 with **no megakernel changes**:
+
+- **RTF 0.77 → ~0.11** — accelerate the code-predictor with a hand-written GQA forward + whole-frame Inductor fusion + one CUDA-graph capture (~10.8 → ~3.0 ms/frame). Gated at **0.9999** teacher-forced logit cosine vs stock (first-step greedy match 100%; later divergence is fp near-tie amplification, not a forward bug).
+- **TTFC 162 → ~58 ms** — batch the 110-token talker prefill and bridge its K/V straight into the kernel's cache (the kernel stores K/V identically to HF; post-bridge decode matches the reference at **0.9999**, prefill 87 → 13 ms), then a lock-free `asyncio.Queue` streaming handoff that removed ~22 ms *and* the run-to-run jitter (spread 59–131 → 56–60 ms).
+
+Both primary targets met, with the talker on the megakernel and the code-predictor/codec in PyTorch as the task specifies.
 
 ## Kernel modifications (what we changed in the megakernel)
 
@@ -121,7 +129,7 @@ scripts/          setup_box.sh (one-shot env), reference_run.py, inspect_weights
 requirements_frozen.txt   exact pinned versions
 talker/           validate_talker_trunk.py (0.9999 match), megakernel_talker.py (kernel-driven synthesis)
 bench/            results.md, kernel_step_bench.py (trunk per-step), stage_benchmark.py (§3-4), bench_cp_variants.py + correctness_cp.py (§5a code-predictor accel + gate)
-pipecat_service/  megakernel_tts_service.py, graphed_code_predictor_v3.py (hand-written GQA + Inductor-fused whole-frame CUDA graph, RTF ~0.11) + _v2.py (HF-module whole-frame graph) + graphed_code_predictor.py (v1), streaming_tts.py, bot_daily.py (Daily demo), bot_ws.py + index.html (local WS demo), bot.py (earlier SmallWebRTC variant; superseded by bot_daily.py — NAT/ICE issues from a headless box)
+pipecat_service/  megakernel_tts_service.py, graphed_code_predictor_v3.py (hand-written GQA + Inductor-fused whole-frame CUDA graph, RTF ~0.11) + _v2.py / graphed_code_predictor.py (v2/v1 fallbacks), streaming_tts.py, bot_daily.py (Daily demo), bot_ws.py + index.html (optional local WS demo)
 recording/        demo_voice_agent.mov (end-to-end voice-agent demo)
 ```
 
